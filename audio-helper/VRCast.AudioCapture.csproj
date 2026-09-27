@@ -12,7 +12,9 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="NAudio.Core" HintPath="C:\Users\NM\.nuget\packages\naudio.core\2.3.0\lib\netstandard2.0\NAudio.Core.dll" Private="true" />
-    <Reference Include="NAudio.Wasapi" HintPath="C:\Users\NM\.nuget\packages\naudio.wasapi\2.3.0\lib\net9.0-windows10.0.26100\NAudio.Wasapi.dll" Private="true" />
+    <!-- Раньше здесь стояли пути в NuGet-кеш на машине автора (C:\Users\NM\...),
+         и помощник собирался только у него. Пакеты тянет сам NuGet. -->
+    <PackageReference Include="NAudio.Core" Version="2.3.0" />
+    <PackageReference Include="NAudio.Wasapi" Version="2.3.0" />
   </ItemGroup>
 </Project>
