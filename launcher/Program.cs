@@ -117,6 +117,14 @@ internal static class Program
             ["VRCast.Payload.logo.png"] = Path.Combine("public", "logo.png"),
             ["VRCast.Payload.standby.png"] = Path.Combine("public", "standby.png")
         };
+        // Модули ядра (src/lib) вшиваются по маске — новый файл не нужно
+        // прописывать здесь руками, а забытый модуль ронял бы сервер на старте.
+        const libPrefix = "VRCast.Payload.lib.";
+        foreach (var name in typeof(Program).Assembly.GetManifestResourceNames())
+        {
+            if (name.StartsWith(libPrefix, StringComparison.Ordinal))
+                resources[name] = Path.Combine("src", "lib", name[libPrefix.Length..]);
+        }
 
         var assembly = typeof(Program).Assembly;
         foreach (var resource in resources)

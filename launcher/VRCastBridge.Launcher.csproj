@@ -27,6 +27,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4078.44" />
     <EmbeddedResource Include="..\src\server.js" LogicalName="VRCast.Payload.server.js" />
+    <EmbeddedResource Include="..\src\lib\*.js" LogicalName="VRCast.Payload.lib.%(Filename)%(Extension)" />
     <EmbeddedResource Include="..\public\index.html" LogicalName="VRCast.Payload.index.html" />
     <EmbeddedResource Include="..\public\styles.css" LogicalName="VRCast.Payload.styles.css" />
     <EmbeddedResource Include="..\public\app.js" LogicalName="VRCast.Payload.app.js" />
