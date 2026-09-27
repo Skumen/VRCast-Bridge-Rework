@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { connect as netConnect } from 'node:net';
 import { statfs } from 'node:fs/promises';
+import { INPUT_QUEUE_PROBE, READRATE_BURST_PROBE, adaptFfmpegArgs, pickFfmpegAsset } from './lib/ffmpeg-compat.js';
 
 const APP_VERSION = '0.54.10';
 
@@ -111,6 +112,7 @@ let relayProfile = null;
 let mediaMtxProcess = null;
 let mediaMtxFailures = 0;
 let mediaMtxLastError = '';
+const mediaMtxUnknownFields = new Set();
 const rtspPushProcesses = new Map();
 let lastRemotePushError = '';
 const rtspPushTimers = new Map();
@@ -245,6 +247,28 @@ function spawnCollect(command, args, timeout = 10000, options = {}) {
   });
 }
 
+// Что умеет ffmpeg, который сейчас в PATH. Проверяется при старте и заново
+// после докачки или смены ffmpeg (refreshToolsAsync).
+const ffmpegCaps = { inputThreadQueue: true, readrateBurst: false };
+
+function probeFfmpegCapsSync() {
+  const probe = args => spawnSync('ffmpeg', args, { windowsHide: true, encoding: 'utf8', timeout: 8000 });
+  const queue = probe(INPUT_QUEUE_PROBE), burst = probe(READRATE_BURST_PROBE);
+  if (!queue.error) ffmpegCaps.inputThreadQueue = queue.status === 0;
+  if (!burst.error) ffmpegCaps.readrateBurst = burst.status === 0;
+}
+
+async function probeFfmpegCaps() {
+  const [queue, burst] = await Promise.all([spawnCollect('ffmpeg', INPUT_QUEUE_PROBE, 8000), spawnCollect('ffmpeg', READRATE_BURST_PROBE, 8000)]);
+  if (queue.status !== -1) ffmpegCaps.inputThreadQueue = queue.status === 0;
+  if (burst.status !== -1) ffmpegCaps.readrateBurst = burst.status === 0;
+  logDetail(`ffmpeg: очередь входа — ${ffmpegCaps.inputThreadQueue ? 'да' : 'нет'}, без залпа на старте — ${ffmpegCaps.readrateBurst ? 'да' : 'нет'}`);
+}
+
+function spawnFfmpeg(args, options) {
+  return spawn('ffmpeg', adaptFfmpegArgs(args, ffmpegCaps), options);
+}
+
 function encoderWorks(name) {
   if (!toolAvailable('ffmpeg', ['-version'])) return false;
   // format=nv12 обязателен для Intel QuickSync и не мешает остальным: без
@@ -266,7 +290,9 @@ const TOOL_SOURCES = {
   // ffmpeg тянем с GitHub, а не с gyan.dev: за VPN gyan отдаёт свои 100+ МБ по
   // 0.2 МБ/с (минуты и таймаут), а GitHub-зеркало — 8 МБ/с. Нужна сборка gpl:
   // в ней есть libx264, на который откатывается кодирование на процессоре.
-  'ffmpeg.exe': { label: 'кодировщик', github: 'BtbN/FFmpeg-Builds', tag: 'latest', asset: /win64-gpl\.zip$/i, unpack: ['ffmpeg.exe', 'ffprobe.exe'] },
+  // Из релиза берётся самая свежая стабильная ветка (nX.Y), а не master:
+  // master однажды уже сломал опции входа, и эфир не поднимался вовсе.
+  'ffmpeg.exe': { label: 'кодировщик', github: 'BtbN/FFmpeg-Builds', tag: 'latest', pick: assets => pickFfmpegAsset(assets, 'win64'), unpack: ['ffmpeg.exe', 'ffprobe.exe'] },
 };
 let toolDownloads = {};
 
@@ -301,6 +327,7 @@ let tools = {
   mediamtx: Boolean(MEDIAMTX()),
   plink: Boolean(PLINK()),
 };
+if (tools.ffmpeg) probeFfmpegCapsSync();
 // Пробуем аппаратные кодировщики по очереди: NVIDIA, потом AMD, потом
 // встроенная графика Intel. Что первым отзовётся на пробном кадре — тем и
 // кодируем. Проба тяжёлая (запуск ffmpeg), поэтому результат кешируем.
@@ -1337,7 +1364,8 @@ async function downloadTool(name) {
         : `https://api.github.com/repos/${source.github}/releases/latest`;
       const release = await fetch(relApi,
         { headers: { 'User-Agent': 'VRCast-Bridge' }, signal: AbortSignal.timeout(20000) }).then(r => r.json());
-      url = (release.assets || []).find(item => source.asset.test(item.name))?.browser_download_url;
+      const asset = source.pick ? source.pick(release.assets) : (release.assets || []).find(item => source.asset.test(item.name));
+      url = asset?.browser_download_url;
       if (!url) throw new Error('нет подходящего файла в релизе');
     }
     log(`Догружаю компонент: ${source.label}`);
@@ -1388,6 +1416,7 @@ function findFile(directory, name) {
 async function refreshToolsAsync() {
   const проба = async (name, args) => (await spawnCollect(name, args, 5000).catch(() => null))?.status === 0;
   tools.ffmpeg = await проба('ffmpeg', ['-version']);
+  if (tools.ffmpeg) await probeFfmpegCaps();
   // ytdlpPath() в конце возвращает 'yt-dlp' — оно всегда истинно, поэтому
   // проверяем именно наличие файла, а не путь.
   tools.ytdlp = existsSync(YTDLP_UPDATED) || existsSync(join(DATA_DIR, 'tools', 'yt-dlp.exe')) || existsSync(YTDLP_BUNDLED);
@@ -2245,7 +2274,7 @@ function runScreenProcess(args, audioHelperArgs = null, windowHelperArgs = null)
   log(`Захват экрана · ${encoder.label} · ${config.quality}/${config.fps} FPS`);
   stopStandby();
   const stdio = ['ignore', 'pipe', 'pipe', audioHelperArgs ? 'pipe' : 'ignore', windowHelperArgs ? 'pipe' : 'ignore'];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio });
   let aux = null;
   let windowCapture = null;
   activeProcess = child;
@@ -2482,7 +2511,7 @@ function startMediaMtx() {
   // UDP 8000/8001 (RTP/RTCP) и 8892/8893 (Media-over-QUIC). Любая программа на
   // этих портах — и сервер не поднимался бы вовсе, а два экземпляра VRCast
   // конфликтовали бы между собой.
-  writeFileSync(configFile, [
+  const lines = [
     'logLevel: error', `rtspAddress: :${RTSP_PORT}`,
     `rtpAddress: :${rtpPort}`, `rtcpAddress: :${rtpPort + 1}`,
     `multicastRTPPort: ${rtpPort + 2}`, `multicastRTCPPort: ${rtpPort + 3}`,
@@ -2495,14 +2524,27 @@ function startMediaMtx() {
     '- user: any', '  permissions:', '  - action: read',
     `- user: vrcast`, `  pass: ${rtspPublishPass}`, `  ips: ['127.0.0.1']`, '  permissions:', '  - action: publish',
     'paths:', '  live: {}', '',
-  ].join('\n'), 'utf8');
-  const child = spawn(MEDIAMTX(), [configFile], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  ];
+  // Поля, которых не знает именно эта версия MediaMTX, выкидываем: новые
+  // ключи (например, moq) старый сервер встречает отказом запуститься.
+  writeFileSync(configFile, lines.filter(line => !mediaMtxUnknownFields.has(line.split(':')[0])).join('\n'), 'utf8');
+  // MediaMTX пишет журнал в stdout — раньше он выбрасывался, и причина
+  // падения («unknown field …») нигде не была видна.
+  const child = spawn(MEDIAMTX(), [configFile], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   mediaMtxProcess = child;
-  child.stderr?.setEncoding('utf8');
-  child.stderr?.on('data', chunk => {
+  const разобрать = chunk => {
     const строка = String(chunk).trim().split(String.fromCharCode(10)).pop();
-    if (строка) { mediaMtxLastError = строка.slice(0, 200); logDetail(`RTSP-сервер: ${строка.slice(0, 300)}`); }
-  });
+    if (!строка) return;
+    mediaMtxLastError = строка.slice(0, 200); logDetail(`RTSP-сервер: ${строка.slice(0, 300)}`);
+    const незнакомое = /unknown field "([a-zA-Z0-9_]+)"/.exec(строка)?.[1];
+    if (незнакомое && !mediaMtxUnknownFields.has(незнакомое)) {
+      mediaMtxUnknownFields.add(незнакомое);
+      mediaMtxFailures = Math.max(0, mediaMtxFailures - 1);
+      log(`RTSP-сервер не знает настройку «${незнакомое}» — запускаю без неё`);
+    }
+  };
+  child.stdout?.setEncoding('utf8'); child.stdout?.on('data', разобрать);
+  child.stderr?.setEncoding('utf8'); child.stderr?.on('data', разобрать);
   // Поднялись после падения — публикацию надо восстановить самим. Без этого
   // сервер работал, а канал оставался пустым: пушер умер вместе с ним, а его
   // собственная попытка перезапуска пришлась на те секунды, когда сервера ещё
@@ -2635,7 +2677,7 @@ function startRtspPush() {
     // а из MPEG-TS он приходит в ADTS — с «-c copy» публикация просто не стартует
     // («AAC with no global headers»), aac_adtstoasc тут не помогает, потому что
     // заголовок SDP пишется до первого пакета.
-    const child = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-fflags', '+genpts+discardcorrupt',
+    const child = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', '-fflags', '+genpts+discardcorrupt',
       // Без nobuffer и с запасом на разбор: публикация стартует раньше, чем
       // relay выдаст первый кадр, и с урезанным probesize ffmpeg сдавался —
       // «dimensions not set», падение, перезапуск по кругу. Теперь он спокойно
@@ -2755,7 +2797,7 @@ function startRelay(profile) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts+discardcorrupt',
     '-probesize', '1000000', '-analyzeduration', '1000000', '-thread_queue_size', '1024', '-f', 'mpegts', '-i', 'pipe:0',
     '-map', '0:v:0', '-map', '0:a:0', ...relayOutputArgs(profile)];
-  relayProcess = spawn('ffmpeg', args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+  relayProcess = spawnFfmpeg(args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
   relayProcess.stdin.on('error', error => {
     if (!stopping) log(`Канал HLS: ${error.message}`);
   });
@@ -2805,7 +2847,7 @@ function preparePausedFrame(media, position, preferredBroadcastFrame = null, pre
     rmSync(frameFile, { force: true });
     const seekArgs = broadcastFrameSource ? [] : ['-ss', Math.max(0, Number(position) || 0).toFixed(3)];
     const frameFilter = `${broadcastFrameSource ? 'reverse,' : ''}scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
-    const extractor = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...seekArgs, '-i', source,
+    const extractor = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', ...seekArgs, '-i', source,
       '-frames:v', '1', '-vf', frameFilter,
       '-c:v', 'png', '-threads', '1', '-update', '1', '-y', frameFile],
     { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -2826,7 +2868,7 @@ function startPausedFrameProducer(frameFile) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-re', '-loop', '1', '-framerate', String(profile.fps), '-i', frameFile,
     '-re', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-map', '0:v:0', '-map', '1:a:0',
     '-r', String(profile.fps), '-fps_mode', 'cfr', ...mpegTsOutputArgs(profile)];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   standbyProcess = child;
   pipeToRelay(child);
   attachProcessLogs(child, 'Paused frame');
@@ -2874,7 +2916,7 @@ function startStandby(profile = sessionProfile()) {
     '-re', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-map', '0:v:0', '-map', '1:a:0',
     '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
     '-r', String(profile.fps), '-fps_mode', 'cfr', ...mpegTsOutputArgs(profile)];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   standbyProcess = child;
   pipeToRelay(child);
   attachProcessLogs(child, 'Standby');
@@ -3221,7 +3263,7 @@ function unityVideoEncodeArgs(profile) {
 
 function runUnityFfmpeg(args, label, generation = unityBuildGeneration) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
     unityBuildProcess = child;
     let stderr = '';
     child.stderr.setEncoding('utf8');
@@ -3326,7 +3368,7 @@ function startUnityCaptureRecording() {
   const args = ['-hide_banner', '-loglevel', 'warning', '-live_start_index', '-2', '-i', `http://127.0.0.1:${PORT}/stream/live.m3u8`,
     '-map', '0:v:0', '-map', '0:a:0', '-vf', 'setpts=PTS-STARTPTS', '-af', 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0',
     ...unityVideoEncodeArgs(profile), '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2', '-movflags', '+faststart', '-y', temporary];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
   unityCaptureProcess = child; unityCaptureStartedAt = Date.now();
   unityCapture = { state: 'recording', message: 'Идёт запись захвата…', updatedAt: Date.now() };
   let stderr = '';
@@ -3393,9 +3435,13 @@ async function prefetchQueue(fromIndex = queueIndex) {
   } finally { prefetching = false; }
 }
 
-// Декодирование отдаём видеокарте: при неудаче ffmpeg сам возвращается к
-// программному пути, поэтому флаг безопасен для любых источников.
-const HWACCEL = ['-hwaccel', 'auto'];
+// Декодирование отдаём видеокарте: обычно при неудаче ffmpeg сам
+// возвращается к программному пути. Но не всегда — со сломанным драйвером
+// (или без libva) ffmpeg падает аварийно на первом кадре, и трек тут же
+// «заканчивался». Тогда до конца сеанса декодируем процессором.
+let hwDecode = true;
+const HWDECODE_TROUBLE = /Device creation failed|hwaccel|hw_device|Assertion .* failed|Failed to (?:create|initialise) .*(?:device|decoder)/i;
+function hwaccelArgs() { return hwDecode ? ['-hwaccel', 'auto'] : []; }
 
 function queueProducerArgs(media, timestampOffset, seekPosition = 0) {
   const profile = sessionProfile('queue');
@@ -3414,7 +3460,7 @@ function queueProducerArgs(media, timestampOffset, seekPosition = 0) {
   }
   if (media.videoUrl && media.audioUrl && media.videoUrl !== media.audioUrl) {
     if (seekPosition > 0) args.push('-ss', seekPosition.toFixed(3));
-    args.push(...headerArgs, '-thread_queue_size', '1024', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', ...HWACCEL, '-re', '-i', media.videoUrl);
+    args.push(...headerArgs, '-thread_queue_size', '1024', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', ...hwaccelArgs(), '-re', '-i', media.videoUrl);
     videoIndex = inputIndex++;
     if (seekPosition > 0) args.push('-ss', seekPosition.toFixed(3));
     args.push(...headerArgs, '-thread_queue_size', '1024', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', '-re', '-i', media.audioUrl);
@@ -3429,7 +3475,7 @@ function queueProducerArgs(media, timestampOffset, seekPosition = 0) {
     // видео просто игнорируется) и всегда держим темп реального времени:
     // без него готовый плейлист проглатывается вдвое быстрее и эфир уезжает.
     if (media.live) args.push('-live_start_index', '-1');
-    args.push(...HWACCEL, '-re', '-i', source);
+    args.push(...hwaccelArgs(), '-re', '-i', source);
     if (media.hasVideo) videoIndex = inputIndex;
     if (media.hasAudio) audioIndex = inputIndex;
     inputIndex++;
@@ -3504,15 +3550,17 @@ async function startQueueItem(index, position = 0, generation = playGeneration, 
     if (manualTransition) return;
     currentDuration = media.duration || item.duration || null;
     stopStandby();
-    const child = spawn('ffmpeg', queueProducerArgs(media, markProducerTimestamp(nextProducerTimestamp()), sourcePosition), { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawnFfmpeg(queueProducerArgs(media, markProducerTimestamp(nextProducerTimestamp()), sourcePosition), { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     activeProcess = child;
     pipeToRelay(child);
     currentStartedAt = Date.now();
     playbackBusy = false;
     log(`Сейчас играет: ${item.title}`);
     attachProcessLogs(child, 'Track');
+    let hwTrouble = false;
+    child.stderr?.on('data', chunk => { if (hwDecode && HWDECODE_TROUBLE.test(String(chunk))) hwTrouble = true; });
     preloadNext(queueIndex);
-    child.on('close', code => {
+    child.on('close', (code, signal) => {
       // A rapid seek/jump may already have replaced this producer.  In that
       // case its late close event must not advance or stop the new track.
       if (activeProcess !== child) return;
@@ -3529,6 +3577,14 @@ async function startQueueItem(index, position = 0, generation = playGeneration, 
       // При переходе на другой трек заставку не поднимаем: следующий
       // производитель стартует через десятки миллисекунд, а лишний запуск
       // ffmpeg только добавлял задержку на каждое переключение.
+      // Аварийное падение на аппаратном декодере — не конец трека: повторяем
+      // с того же места, но уже процессором.
+      if (!transition && (code || signal) && hwTrouble && hwDecode && ranFor < 8) {
+        hwDecode = false;
+        playbackBusy = true;
+        log('Аппаратное декодирование не работает на этой машине — перехожу на процессор');
+        return setTimeout(() => startQueueItem(queueIndex, sourcePosition, generation, retry), ПАУЗА_ПОВТОРА);
+      }
       if (transition?.type !== 'seek' && transition?.type !== 'jump') startStandby(sessionProfile('queue'));
       if (transition?.type === 'seek') return setTimeout(() => startQueueItem(queueIndex, transition.position, generation), ПАУЗА_ПЕРЕХОДА);
       if (transition?.type === 'jump') return setTimeout(() => startQueueItem(transition.index, transition.position || 0, generation), ПАУЗА_ПЕРЕХОДА);
@@ -3868,7 +3924,7 @@ function качатьПревью() {
          '-frames:v', '1', '-vf', 'scale=320:-2', '-q:v', '4', '-y', destination]
       : ['-hide_banner', '-loglevel', 'error', '-i', item.sourceUrl,
          '-an', '-map', 'disp:attached_pic', '-vf', 'scale=320:-2', '-q:v', '4', '-y', destination];
-    const child = spawn('ffmpeg', args, { windowsHide: true, stdio: 'ignore' });
+    const child = spawnFfmpeg(args, { windowsHide: true, stdio: 'ignore' });
     previewChildren.add(child);
     const дальше = () => { previewChildren.delete(child); занятоПревью--; качатьПревью(); };
     child.on('close', code => {
@@ -4085,7 +4141,7 @@ async function ensureLivePreview() {
     if (!existsSync(helper)) return false;
     const захват = spawn(helper, ['--hwnd', String(rect.handle), '--width', '960', '--height', '540', '--fps', кадры],
       { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
-    const перевод = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12',
+    const перевод = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12',
       '-video_size', '960x540', '-framerate', кадры, '-i', 'pipe:0',
       '-vf', `fps=${кадры}`, '-q:v', '5', '-update', '1', '-y', CAPTURE_PREVIEW],
       { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
@@ -4098,7 +4154,7 @@ async function ensureLivePreview() {
     if (rect) args.push('-offset_x', String(rect.x), '-offset_y', String(rect.y), '-video_size', `${rect.width}x${rect.height}`, '-i', 'desktop');
     else args.push('-i', 'desktop');
     args.push('-vf', 'scale=960:-2:flags=fast_bilinear', '-q:v', '5', '-update', '1', '-y', CAPTURE_PREVIEW);
-    previewProcess = spawn('ffmpeg', args, { windowsHide: true, stdio: 'ignore' });
+    previewProcess = spawnFfmpeg(args, { windowsHide: true, stdio: 'ignore' });
   }
   previewKind = вид;
   previewIdleTimer = setInterval(() => {
@@ -4129,7 +4185,7 @@ async function generateCapturePreview() {
     const helper = join(ROOT, 'tools', 'VRCast.WindowCapture.exe');
     if (!existsSync(helper)) throw new Error('Компонент изолированного захвата окна не найден.');
     const capture = spawn(helper, ['--hwnd', rect.handle, '--width', '960', '--height', '540', '--fps', '5'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    const converter = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12', '-video_size', '960x540', '-framerate', '5', '-i', 'pipe:0', '-frames:v', '1', '-q:v', '3', '-y', CAPTURE_PREVIEW], { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+    const converter = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12', '-video_size', '960x540', '-framerate', '5', '-i', 'pipe:0', '-frames:v', '1', '-q:v', '3', '-y', CAPTURE_PREVIEW], { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
     capture.stdout.on('error', () => {}); converter.stdin.on('error', () => {});
     capture.stdout.pipe(converter.stdin);
     let errorText = '';
