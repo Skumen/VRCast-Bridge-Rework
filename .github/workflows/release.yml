@@ -1,0 +1,99 @@
+name: Релиз
+
+# Выпуск версии: поднять версию (package.json, src/server.js, csproj), влить в
+# main и поставить тег:  git tag v0.55.0 && git push origin v0.55.0
+# Дальше всё сделает этот workflow: соберёт EXE, подпишет его сертификатом из
+# секретов репозитория и опубликует релиз — программа у людей найдёт его сама.
+# Сертификат создаётся один раз скриптом tools/new-signing-cert.ps1.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Версия совпадает с тегом
+        run: node tools/check-version.mjs "${{ github.ref_name }}"
+      - run: npm ci
+      - run: npm run test:unit
+
+      - name: Сертификат подписи
+        env:
+          PFX: ${{ secrets.SIGNING_CERT_PFX }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          # Без своего сертификата релиз не выпускаем: неподписанная программа
+          # не сможет принять ни одного обновления.
+          if (-not $env:PFX) { throw 'Нет секрета SIGNING_CERT_PFX. Создайте сертификат: tools/new-signing-cert.ps1' }
+          $path = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:PFX))
+          if (-not $env:PFX_PASSWORD) { throw 'Нет секрета SIGNING_CERT_PASSWORD — пароля от .pfx' }
+          $password = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $path -CertStoreLocation Cert:\CurrentUser\My -Password $password |
+            Where-Object HasPrivateKey | Select-Object -First 1
+          Remove-Item $path -Force
+          if (-not $cert) { throw 'В SIGNING_CERT_PFX нет закрытого ключа' }
+          Write-Host "Подписываю сертификатом $($cert.Subject), отпечаток $($cert.Thumbprint)"
+          "SIGNING_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: Звук (C#)
+        run: |
+          dotnet publish audio-helper/VRCast.AudioCapture.csproj -c Release -o audio-helper/bin/publish
+          copy audio-helper\bin\publish\VRCast.AudioCapture.exe tools\
+      - name: Захват окна (Rust)
+        run: |
+          cargo build --release --manifest-path capture-helper/Cargo.toml
+          copy capture-helper\target\release\vrcast-window-capture.exe tools\VRCast.WindowCapture.exe
+      - name: plink
+        run: Invoke-WebRequest -Uri https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe -OutFile tools\plink.exe -UseBasicParsing
+
+      # Помощники вшиваются внутрь EXE, поэтому подписываем их до сборки лаунчера.
+      - name: Подпись помощников
+        run: ./tools/sign-files.ps1 -Thumbprint $env:SIGNING_THUMBPRINT -Files tools\VRCast.AudioCapture.exe, tools\VRCast.WindowCapture.exe
+      - name: Лаунчер
+        run: dotnet publish launcher/VRCastBridge.Launcher.csproj -c Release -o launcher/bin/publish
+      - name: Подпись программы
+        run: ./tools/sign-files.ps1 -Thumbprint $env:SIGNING_THUMBPRINT -Files 'launcher\bin\publish\VRCast Bridge.exe'
+
+      - name: Файлы релиза
+        run: |
+          New-Item -ItemType Directory release | Out-Null
+          Copy-Item 'launcher\bin\publish\VRCast Bridge.exe' release\
+          # Публичная часть сертификата: установив её в доверенные, Windows
+          # покажет имя издателя вместо «неизвестный издатель».
+          Export-Certificate -Cert (Get-Item "Cert:\CurrentUser\My\$env:SIGNING_THUMBPRINT") -FilePath release\vrcast-code-signing.cer | Out-Null
+          $hash = (Get-FileHash 'release\VRCast Bridge.exe' -Algorithm SHA256).Hash.ToLower()
+          "$hash  VRCast Bridge.exe" | Out-File release\SHA256SUMS.txt -Encoding ascii
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: VRCast Bridge ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/VRCast Bridge.exe
+            release/vrcast-code-signing.cer
+            release/SHA256SUMS.txt
+
+      - name: Убрать сертификат с машины
+        if: always()
+        run: |
+          if ($env:SIGNING_THUMBPRINT) { Remove-Item "Cert:\CurrentUser\My\$env:SIGNING_THUMBPRINT" -DeleteKey -ErrorAction SilentlyContinue }

@@ -101,13 +101,24 @@ GitHub Actions на каждом пуше гоняет тесты со стаб�
 
 ## Выпуск версии
 
-Программа ищет обновления в [релизах этого репозитория](https://github.com/Skumen/VRCast-Bridge-Rework/releases). Чтобы обновление дошло до людей:
+Программа ищет обновления в [релизах этого репозитория](https://github.com/Skumen/VRCast-Bridge-Rework/releases), а выпускает их GitHub Actions (`.github/workflows/release.yml`): собирает EXE, подписывает и публикует релиз.
 
-1. Поднимите версию в `package.json`, `src/server.js` (`APP_VERSION`) и `launcher/VRCastBridge.Launcher.csproj`.
-2. Соберите и подпишите EXE (`tools/sign.ps1`).
-3. Создайте релиз с тегом `vX.Y.Z` и приложите `VRCast Bridge.exe`.
+**Один раз — сертификат подписи.** На Windows в папке проекта:
 
-Новая версия ставится, только если подписана **тем же сертификатом**, что и установленная. Сертификат создаётся один раз в хранилище Windows (`Cert:\CurrentUser\My`, «VRCast Bridge code signing») — экспортируйте его с закрытым ключом в .pfx и храните копию. Потеряете ключ — обновиться автоматически уже не выйдет, только скачать вручную.
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/new-signing-cert.ps1
+```
+
+Скрипт создаст сертификат, сохранит его с закрытым ключом в `vrcast-signing.pfx` и положит в буфер обмена в виде Base64. В репозитории на GitHub: **Settings → Secrets and variables → Actions → New repository secret** — добавьте `SIGNING_CERT_PFX` (вставить из буфера) и `SIGNING_CERT_PASSWORD` (пароль, введённый в скрипте).
+
+Новая версия ставится, только если подписана **тем же сертификатом**, что и установленная. Сохраните `vrcast-signing.pfx` и пароль в надёжном месте и никогда не коммитьте их: потеряете — установленные копии перестанут обновляться сами.
+
+**Каждый выпуск.**
+
+1. Поднимите версию в `package.json`, `src/server.js` (`APP_VERSION`) и `launcher/VRCastBridge.Launcher.csproj` и влейте в `main`.
+2. Поставьте тег: `git tag v0.55.0 && git push origin v0.55.0` (или создайте релиз с новым тегом на странице Releases).
+
+Workflow проверит, что версия везде совпадает с тегом, соберёт и подпишет EXE и опубликует релиз с файлами `VRCast Bridge.exe`, `vrcast-code-signing.cer` и `SHA256SUMS.txt`.
 
 ## Лицензия
 
