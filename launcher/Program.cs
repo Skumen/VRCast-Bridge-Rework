@@ -119,7 +119,7 @@ internal static class Program
         };
         // Модули ядра (src/lib) вшиваются по маске — новый файл не нужно
         // прописывать здесь руками, а забытый модуль ронял бы сервер на старте.
-        const libPrefix = "VRCast.Payload.lib.";
+        const string libPrefix = "VRCast.Payload.lib.";
         foreach (var name in typeof(Program).Assembly.GetManifestResourceNames())
         {
             if (name.StartsWith(libPrefix, StringComparison.Ordinal))
