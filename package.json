@@ -1,13 +1,14 @@
 {
   "name": "vrcast-bridge",
-  "version": "0.54.10",
+  "version": "0.55.0",
   "private": true,
   "description": "Локальный мост для трансляции экрана и медиаплейлистов в видеоплееры VRChat",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
     "check": "node --check src/server.js && node --check public/app.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:unit": "node --test test/unit.test.js"
   },
   "engines": {
     "node": ">=20"

@@ -14,7 +14,7 @@ let dataDirectory;
 function launchServer() {
   return spawn(process.execPath, ['src/server.js'], {
     cwd: new URL('..', import.meta.url),
-    env: { ...process.env, VRCAST_PORT: String(port), LOCALAPPDATA: dataDirectory },
+    env: { ...process.env, VRCAST_PORT: String(port), LOCALAPPDATA: dataDirectory, VRCAST_OFFLINE: '1' },
     windowsHide: true, stdio: 'ignore',
   });
 }

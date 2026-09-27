@@ -7,8 +7,15 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { connect as netConnect } from 'node:net';
 import { statfs } from 'node:fs/promises';
+import { prepareLivePlaylist } from './lib/hls.js';
+import { directTitle, parseMediaInfo, настоящееВидео } from './lib/media.js';
+import { createPtsReader } from './lib/mpegts.js';
+import { isPrivateIp } from './lib/net.js';
+import { judgeUpdateSignature, parseSignatureLine, versionIsNewer } from './lib/update.js';
+import { INPUT_QUEUE_PROBE, READRATE_BURST_PROBE, adaptFfmpegArgs, pickFfmpegAsset } from './lib/ffmpeg-compat.js';
 
-const APP_VERSION = '0.54.10';
+const APP_VERSION = '0.55.0';
+const OFFLINE = process.env.VRCAST_OFFLINE === '1';
 
 // Свободное место проверяем редко и в фоне: на полном диске ffmpeg не может
 // дописывать сегменты, эфир встаёт рывками, а причина ниоткуда не видна.
@@ -111,6 +118,7 @@ let relayProfile = null;
 let mediaMtxProcess = null;
 let mediaMtxFailures = 0;
 let mediaMtxLastError = '';
+const mediaMtxUnknownFields = new Set();
 const rtspPushProcesses = new Map();
 let lastRemotePushError = '';
 const rtspPushTimers = new Map();
@@ -245,6 +253,28 @@ function spawnCollect(command, args, timeout = 10000, options = {}) {
   });
 }
 
+// Что умеет ffmpeg, который сейчас в PATH. Проверяется при старте и заново
+// после докачки или смены ffmpeg (refreshToolsAsync).
+const ffmpegCaps = { inputThreadQueue: true, readrateBurst: false };
+
+function probeFfmpegCapsSync() {
+  const probe = args => spawnSync('ffmpeg', args, { windowsHide: true, encoding: 'utf8', timeout: 8000 });
+  const queue = probe(INPUT_QUEUE_PROBE), burst = probe(READRATE_BURST_PROBE);
+  if (!queue.error) ffmpegCaps.inputThreadQueue = queue.status === 0;
+  if (!burst.error) ffmpegCaps.readrateBurst = burst.status === 0;
+}
+
+async function probeFfmpegCaps() {
+  const [queue, burst] = await Promise.all([spawnCollect('ffmpeg', INPUT_QUEUE_PROBE, 8000), spawnCollect('ffmpeg', READRATE_BURST_PROBE, 8000)]);
+  if (queue.status !== -1) ffmpegCaps.inputThreadQueue = queue.status === 0;
+  if (burst.status !== -1) ffmpegCaps.readrateBurst = burst.status === 0;
+  logDetail(`ffmpeg: очередь входа — ${ffmpegCaps.inputThreadQueue ? 'да' : 'нет'}, без залпа на старте — ${ffmpegCaps.readrateBurst ? 'да' : 'нет'}`);
+}
+
+function spawnFfmpeg(args, options) {
+  return spawn('ffmpeg', adaptFfmpegArgs(args, ffmpegCaps), options);
+}
+
 function encoderWorks(name) {
   if (!toolAvailable('ffmpeg', ['-version'])) return false;
   // format=nv12 обязателен для Intel QuickSync и не мешает остальным: без
@@ -266,7 +296,9 @@ const TOOL_SOURCES = {
   // ffmpeg тянем с GitHub, а не с gyan.dev: за VPN gyan отдаёт свои 100+ МБ по
   // 0.2 МБ/с (минуты и таймаут), а GitHub-зеркало — 8 МБ/с. Нужна сборка gpl:
   // в ней есть libx264, на который откатывается кодирование на процессоре.
-  'ffmpeg.exe': { label: 'кодировщик', github: 'BtbN/FFmpeg-Builds', tag: 'latest', asset: /win64-gpl\.zip$/i, unpack: ['ffmpeg.exe', 'ffprobe.exe'] },
+  // Из релиза берётся самая свежая стабильная ветка (nX.Y), а не master:
+  // master однажды уже сломал опции входа, и эфир не поднимался вовсе.
+  'ffmpeg.exe': { label: 'кодировщик', github: 'BtbN/FFmpeg-Builds', tag: 'latest', pick: assets => pickFfmpegAsset(assets, 'win64'), unpack: ['ffmpeg.exe', 'ffprobe.exe'] },
 };
 let toolDownloads = {};
 
@@ -301,6 +333,7 @@ let tools = {
   mediamtx: Boolean(MEDIAMTX()),
   plink: Boolean(PLINK()),
 };
+if (tools.ffmpeg) probeFfmpegCapsSync();
 // Пробуем аппаратные кодировщики по очереди: NVIDIA, потом AMD, потом
 // встроенная графика Intel. Что первым отзовётся на пробном кадре — тем и
 // кодируем. Проба тяжёлая (запуск ffmpeg), поэтому результат кешируем.
@@ -1159,24 +1192,6 @@ function setServerLinkMode(id, { permanent, regenerate = false } = {}) {
   return next;
 }
 
-// «Белым» считаем только адрес, по которому машину реально видно из интернета.
-// Кроме RFC1918 отсекаем и то, что наружу не выходит: CGNAT провайдера,
-// тестовые диапазоны (в них часто сидят адаптеры VPN — тот же Koala Clash),
-// multicast и прочее зарезервированное. Иначе адрес VPN выдавался бы за белый.
-function isPrivateIp(ip) {
-  const p = ip.split('.').map(Number);
-  if (p.length !== 4 || p.some(n => Number.isNaN(n) || n < 0 || n > 255)) return true;
-  const [a, b] = p;
-  if (a === 10 || a === 127 || a === 0) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT провайдера
-  if (a === 198 && (b === 18 || b === 19)) return true; // тестовый диапазон / VPN
-  if (a >= 224) return true; // multicast и зарезервированное
-  return false;
-}
-
 // Прямые ссылки на локальный канал. Достаточно одной ссылки для своей сети —
 // берём домашний адрес (192.168/10), а не виртуальные адаптеры WSL/Hyper-V.
 // Белый IP (задан вручную или реальный публичный на карте) даёт ссылку через
@@ -1259,18 +1274,12 @@ function unityCompatibility() {
 // Новая версия берётся из релизов на GitHub. Сам EXE заменить на ходу нельзя
 // (он занят), поэтому файл скачивается рядом, а подменяет его при выходе
 // маленький сценарий: дожидается закрытия программы, копирует и запускает.
-const UPDATE_REPO = 'Kevanko/VRCast-Bridge';
+// Форк обновляется из своих релизов. Сборки исходного репозитория подписаны
+// другим ключом и всё равно не прошли бы проверку подписи.
+const UPDATE_REPO = 'Skumen/VRCast-Bridge-Rework';
 const UPDATE_DIR = join(DATA_DIR, 'update');
 const UPDATE_FILE = join(UPDATE_DIR, 'VRCast Bridge.exe');
 
-function versionIsNewer(candidate, current) {
-  const parse = value => String(value).replace(/^v/i, '').split('.').map(part => Number(part) || 0);
-  const [a, b] = [parse(candidate), parse(current)];
-  for (let index = 0; index < Math.max(a.length, b.length); index++) {
-    if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) > (b[index] || 0);
-  }
-  return false;
-}
 
 
 // Загрузка с докачкой. Оборванная связь на середине больше не означает
@@ -1301,7 +1310,14 @@ async function downloadWithResume(url, target, onProgress, попыток = 4) {
       for await (const кусок of ответ.body) {
         // Ждём и ошибку тоже: на переполненном диске drain не придёт никогда,
         // и загрузка висела бы вечно.
-        if (!файл.write(кусок)) await new Promise((ok, bad) => { файл.once('drain', ok); файл.once('error', bad); });
+        // Оба слушателя снимаются после срабатывания любого: иначе на каждый
+        // drain оставался висеть обработчик error, и за загрузку их копились
+        // сотни (MaxListenersExceededWarning).
+        if (!файл.write(кусок)) await new Promise((ok, bad) => {
+          const готово = () => { файл.off('error', сбой); ok(); };
+          const сбой = error => { файл.off('drain', готово); bad(error); };
+          файл.once('drain', готово); файл.once('error', сбой);
+        });
         принято += кусок.length;
         const процент = всего ? Math.round(принято / всего * 100) : 0;
         if (процент !== последнийПроцент) { последнийПроцент = процент; onProgress?.(принято, всего); }
@@ -1337,7 +1353,8 @@ async function downloadTool(name) {
         : `https://api.github.com/repos/${source.github}/releases/latest`;
       const release = await fetch(relApi,
         { headers: { 'User-Agent': 'VRCast-Bridge' }, signal: AbortSignal.timeout(20000) }).then(r => r.json());
-      url = (release.assets || []).find(item => source.asset.test(item.name))?.browser_download_url;
+      const asset = source.pick ? source.pick(release.assets) : (release.assets || []).find(item => source.asset.test(item.name));
+      url = asset?.browser_download_url;
       if (!url) throw new Error('нет подходящего файла в релизе');
     }
     log(`Догружаю компонент: ${source.label}`);
@@ -1388,6 +1405,7 @@ function findFile(directory, name) {
 async function refreshToolsAsync() {
   const проба = async (name, args) => (await spawnCollect(name, args, 5000).catch(() => null))?.status === 0;
   tools.ffmpeg = await проба('ffmpeg', ['-version']);
+  if (tools.ffmpeg) await probeFfmpegCaps();
   // ytdlpPath() в конце возвращает 'yt-dlp' — оно всегда истинно, поэтому
   // проверяем именно наличие файла, а не путь.
   tools.ytdlp = existsSync(YTDLP_UPDATED) || existsSync(join(DATA_DIR, 'tools', 'yt-dlp.exe')) || existsSync(YTDLP_BUNDLED);
@@ -1397,19 +1415,6 @@ async function refreshToolsAsync() {
   tools.plink = Boolean(PLINK());
 }
 
-function refreshTools() {
-  // ffmpeg зовут по имени из десятка мест — проще добавить свою папку в PATH,
-  // чем тащить путь через все вызовы.
-  if (existsSync(join(TOOL_DIR, 'ffmpeg.exe')) && !process.env.PATH.includes(TOOL_DIR)) {
-    process.env.PATH = `${TOOL_DIR};${process.env.PATH}`;
-  }
-  tools.ffmpeg = toolAvailable('ffmpeg', ['-version']);
-  tools.ytdlp = toolAvailable(ytdlpPath());
-  tools.cloudflared = Boolean(CLOUDFLARED()) && toolAvailable(CLOUDFLARED());
-  tools.pinggy = Boolean(PINGGY()) && toolAvailable(PINGGY());
-  tools.mediamtx = Boolean(MEDIAMTX());
-  tools.plink = Boolean(PLINK());
-}
 
 // Если утилита лежит рядом с программой (папка tools возле EXE) — берём её
 // оттуда и не качаем. Так же переезжает pinggy: публичной ссылки на него нет.
@@ -1436,6 +1441,8 @@ async function ensureTools() {
     process.env.PATH = `${TOOL_DIR};${process.env.PATH}`;
   }
   await refreshToolsAsync();
+  // Без сети (тесты, CI, офлайн-сборка) ничего не докачиваем.
+  if (OFFLINE) return;
   const нужно = [];
   if (!existsSync(join(TOOL_DIR, 'yt-dlp.exe')) && !existsSync(YTDLP_UPDATED)) нужно.push('yt-dlp.exe');
   if (!tools.mediamtx) нужно.push('mediamtx.exe');
@@ -1452,7 +1459,7 @@ async function ensureTools() {
 let updateRetryTimer = null;
 
 async function checkForUpdate() {
-  if (!process.env.VRCAST_EXE) return;
+  if (!process.env.VRCAST_EXE || OFFLINE) return;
   try {
     const response = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
       headers: { 'User-Agent': 'VRCast-Bridge', Accept: 'application/vnd.github+json' },
@@ -1515,15 +1522,15 @@ async function downloadUpdate(url, expectedSize) {
   }
 }
 
-// Совпадения размера мало: он ничего не говорит о том, чей это файл. Смотрим,
-// что скачанное подписано тем же издателем, что и сама программа. Полного
-// доверия к цепочке сертификатов здесь нет (сертификат свой), но подменить
-// файл на чужой или неподписанный уже не выйдет.
-const ИЗДАТЕЛЬ = 'CN=VRCast Bridge, O=VRCast Bridge';
-
+// Совпадения размера мало: он ничего не говорит о том, чей это файл. Новый
+// файл обязан быть подписан тем же ключом, что и запущенная программа (см.
+// judgeUpdateSignature) — тогда и чужой «VRCast Bridge», и сборка другого
+// форка, и испорченный после подписи файл отсеиваются.
 async function проверитьПодпись(файл) {
-  const скрипт = `(Get-AuthenticodeSignature -LiteralPath '${файл.replace(/'/g, "''")}') | `
-    + 'ForEach-Object { $_.Status.ToString() + [char]124 + $_.SignerCertificate.Subject }';
+  const путь = value => `'${String(value).replace(/'/g, "''")}'`;
+  const скрипт = `$n = Get-AuthenticodeSignature -LiteralPath ${путь(файл)}; `
+    + `$c = Get-AuthenticodeSignature -LiteralPath ${путь(process.env.VRCAST_EXE || '')}; `
+    + '$n.Status.ToString() + [char]124 + $n.SignerCertificate.Thumbprint + [char]124 + $c.SignerCertificate.Thumbprint';
   // Powershell запускаем с чистым PSModulePath: у собранной программы он в
   // унаследованном окружении бывал пустым/битым, и модуль Microsoft.PowerShell
   // .Security не подгружался — Get-AuthenticodeSignature падал «команда найдена
@@ -1533,23 +1540,21 @@ async function проверитьПодпись(файл) {
   const опции = { env: { ...process.env, PSModulePath: модули } };
   // Свежескачанный 50-МБ exe Windows Defender сразу берёт на проверку и держит
   // файл открытым — Get-AuthenticodeSignature в этот момент не может его
-  // прочитать и молча отдаёт пустоту («не удалось проверить»), из-за чего
-  // обновление срывалось. Поэтому повторяем несколько раз с паузой: как только
-  // антивирус отпускает файл, подпись читается.
-  let строка = '';
+  // прочитать и молча отдаёт пустоту, из-за чего обновление срывалось. Поэтому
+  // повторяем несколько раз с паузой: как только антивирус отпускает файл,
+  // подпись читается.
+  let сведения = parseSignatureLine('');
   for (let попытка = 0; попытка < 6; попытка++) {
     const результат = await spawnCollect('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', скрипт], 25000, опции).catch(() => null);
-    строка = String(результат?.stdout || '').trim();
-    if (строка) break;
+    сведения = parseSignatureLine(результат?.stdout);
+    if (сведения.status && (сведения.status !== 'UnknownError' || сведения.thumbprint)) break;
     logDetail(`Проверка подписи (попытка ${попытка + 1}): status=${результат?.status} stderr=${String(результат?.stderr || '').slice(0, 200)}`);
     await new Promise(resolve => setTimeout(resolve, 800));
   }
-  if (!строка) return { ok: false, причина: 'не удалось проверить (файл занят антивирусом)' };
-  const [состояние, издатель] = строка.split(String.fromCharCode(124));
-  if (состояние === 'NotSigned') return { ok: false, причина: 'файл не подписан' };
-  if (!String(издатель || '').includes('VRCast Bridge')) return { ok: false, причина: 'чужой издатель' };
-  return { ok: true, причина: состояние };
+  if (!сведения.status) return { ok: false, причина: 'не удалось проверить (файл занят антивирусом)' };
+  const вердикт = judgeUpdateSignature(сведения);
+  return { ok: вердикт.ok, причина: вердикт.reason };
 }
 
 // Сценарий подмены: ждёт закрытия программы, ставит новый файл и запускает его.
@@ -2011,19 +2016,6 @@ function bitrate(profile) {
   return `${bitrateKbps(profile)}k`;
 }
 
-function videoEncodeArgs(profile = streamProfile()) {
-  const rate = bitrate(profile);
-  const keyframes = Math.max(8, Math.round(profile.fps * 0.5));
-  const gop = ['-g', String(keyframes), '-keyint_min', String(keyframes)];
-  if (encoder.family === 'nvenc') return ['-c:v', 'h264_nvenc', '-preset', 'p2', '-tune', 'll', '-rc', 'cbr',
-    '-b:v', rate, '-maxrate', rate, '-bufsize', rate, ...gop, '-bf', '0', '-spatial-aq', '1', '-pix_fmt', 'yuv420p'];
-  if (encoder.family === 'amf') return ['-c:v', 'h264_amf', '-usage', 'lowlatency', '-rc', 'cbr',
-    '-b:v', rate, '-maxrate', rate, ...gop, '-bf', '0', '-pix_fmt', 'yuv420p'];
-  if (encoder.family === 'qsv') return ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-b:v', rate,
-    '-maxrate', rate, '-bufsize', rate, ...gop, '-bf', '0', '-async_depth', '1', '-pix_fmt', 'nv12'];
-  return ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p',
-    ...gop, '-sc_threshold', '0', '-b:v', rate, '-maxrate', rate, '-bufsize', rate];
-}
 
 // Раньше здесь стоял constqp: качество постоянное, а битрейт какой получится.
 // На игре это выстреливало до десятков мегабит, канал захлёбывался, и зритель
@@ -2061,12 +2053,6 @@ function producerEncodeArgs(profile = streamProfile()) {
     ...gop, '-sc_threshold', '0', '-bf', '0', '-pix_fmt', 'yuv420p'];
 }
 
-function encodedOutputArgs(profile = streamProfile()) {
-  const common = [...videoEncodeArgs(profile), '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-flush_packets', '1'];
-  return [...common, '-f', 'hls', '-hls_time', '1', '-hls_list_size', '40', '-hls_delete_threshold', '4',
-    '-hls_start_number_source', 'epoch_us', '-hls_flags', 'delete_segments+omit_endlist+program_date_time+independent_segments+temp_file',
-    '-hls_segment_filename', join(HLS_DIR, 'segment-%08d.ts'), join(HLS_DIR, 'live.m3u8')];
-}
 
 function relayOutputArgs(profile) {
   // Короткая история сегментов (~15с на диске): плеер, отставший сильнее,
@@ -2104,25 +2090,9 @@ function nextProducerTimestamp() {
 // возврат старых кадров. Теперь берём метку самого кадра (PTS) из заголовка PES.
 let lastRelayPts = 0;
 
-function trackRelayClock(chunk) {
-  for (let offset = 0; offset + 188 <= chunk.length; offset += 188) {
-    if (chunk[offset] !== 0x47) continue;                     // не начало пакета
-    if ((chunk[offset + 1] & 0x40) === 0) continue;           // не начало PES
-    const adaptation = (chunk[offset + 3] & 0x30) >> 4;
-    if (adaptation === 0 || adaptation === 2) continue;       // полезной нагрузки нет
-    let payload = offset + 4;
-    if (adaptation === 3) payload += 1 + chunk[offset + 4];   // пропускаем поле адаптации
-    if (payload + 14 > offset + 188) continue;
-    if (chunk[payload] !== 0 || chunk[payload + 1] !== 0 || chunk[payload + 2] !== 1) continue;
-    if ((chunk[payload + 7] & 0x80) === 0) continue;          // метки времени нет
-    const b = payload + 9;
-    const pts = (chunk[b] & 0x0e) * 536870912
-      + chunk[b + 1] * 4194304 + (chunk[b + 2] & 0xfe) * 16384
-      + chunk[b + 3] * 128 + ((chunk[b + 4] & 0xfe) >> 1);
-    const seconds = pts / 90000;
-    // Скачок больше часа — это чужая метка или переполнение, её не берём.
-    if (seconds > lastRelayPts && seconds - lastRelayPts < 3600) lastRelayPts = seconds;
-  }
+function trackRelayClock(seconds) {
+  // Скачок больше часа — это чужая метка или переполнение, её не берём.
+  if (seconds !== null && seconds > lastRelayPts && seconds - lastRelayPts < 3600) lastRelayPts = seconds;
 }
 
 function markProducerTimestamp(timestamp) {
@@ -2245,7 +2215,7 @@ function runScreenProcess(args, audioHelperArgs = null, windowHelperArgs = null)
   log(`Захват экрана · ${encoder.label} · ${config.quality}/${config.fps} FPS`);
   stopStandby();
   const stdio = ['ignore', 'pipe', 'pipe', audioHelperArgs ? 'pipe' : 'ignore', windowHelperArgs ? 'pipe' : 'ignore'];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio });
   let aux = null;
   let windowCapture = null;
   activeProcess = child;
@@ -2389,6 +2359,8 @@ async function startScreenInner() {
   // требует нового захвата окна, но звук при этом трогать незачем.
   keepAudioHelper = тотЖеЗахват && Boolean(activeAuxProcess) && audioHelperSignature() === audioHelperKey;
   keepWindowHelper = тотЖеЗахват && Boolean(activeWindowProcess) && windowHelperSignature(текущийПрофиль) === windowHelperKey;
+  // Захвату экрана прогрев очереди не нужен, а канал нужен весь.
+  if (!тотЖеЗахват) stopMediaCacheDownloads();
   stopActive(false, true, true);
   currentId = null; currentStartedAt = null; currentDuration = null;
   const desired = streamProfile('screen');
@@ -2482,7 +2454,7 @@ function startMediaMtx() {
   // UDP 8000/8001 (RTP/RTCP) и 8892/8893 (Media-over-QUIC). Любая программа на
   // этих портах — и сервер не поднимался бы вовсе, а два экземпляра VRCast
   // конфликтовали бы между собой.
-  writeFileSync(configFile, [
+  const lines = [
     'logLevel: error', `rtspAddress: :${RTSP_PORT}`,
     `rtpAddress: :${rtpPort}`, `rtcpAddress: :${rtpPort + 1}`,
     `multicastRTPPort: ${rtpPort + 2}`, `multicastRTCPPort: ${rtpPort + 3}`,
@@ -2495,14 +2467,27 @@ function startMediaMtx() {
     '- user: any', '  permissions:', '  - action: read',
     `- user: vrcast`, `  pass: ${rtspPublishPass}`, `  ips: ['127.0.0.1']`, '  permissions:', '  - action: publish',
     'paths:', '  live: {}', '',
-  ].join('\n'), 'utf8');
-  const child = spawn(MEDIAMTX(), [configFile], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  ];
+  // Поля, которых не знает именно эта версия MediaMTX, выкидываем: новые
+  // ключи (например, moq) старый сервер встречает отказом запуститься.
+  writeFileSync(configFile, lines.filter(line => !mediaMtxUnknownFields.has(line.split(':')[0])).join('\n'), 'utf8');
+  // MediaMTX пишет журнал в stdout — раньше он выбрасывался, и причина
+  // падения («unknown field …») нигде не была видна.
+  const child = spawn(MEDIAMTX(), [configFile], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   mediaMtxProcess = child;
-  child.stderr?.setEncoding('utf8');
-  child.stderr?.on('data', chunk => {
+  const разобрать = chunk => {
     const строка = String(chunk).trim().split(String.fromCharCode(10)).pop();
-    if (строка) { mediaMtxLastError = строка.slice(0, 200); logDetail(`RTSP-сервер: ${строка.slice(0, 300)}`); }
-  });
+    if (!строка) return;
+    mediaMtxLastError = строка.slice(0, 200); logDetail(`RTSP-сервер: ${строка.slice(0, 300)}`);
+    const незнакомое = /unknown field "([a-zA-Z0-9_]+)"/.exec(строка)?.[1];
+    if (незнакомое && !mediaMtxUnknownFields.has(незнакомое)) {
+      mediaMtxUnknownFields.add(незнакомое);
+      mediaMtxFailures = Math.max(0, mediaMtxFailures - 1);
+      log(`RTSP-сервер не знает настройку «${незнакомое}» — запускаю без неё`);
+    }
+  };
+  child.stdout?.setEncoding('utf8'); child.stdout?.on('data', разобрать);
+  child.stderr?.setEncoding('utf8'); child.stderr?.on('data', разобрать);
   // Поднялись после падения — публикацию надо восстановить самим. Без этого
   // сервер работал, а канал оставался пустым: пушер умер вместе с ним, а его
   // собственная попытка перезапуска пришлась на те секунды, когда сервера ещё
@@ -2635,7 +2620,7 @@ function startRtspPush() {
     // а из MPEG-TS он приходит в ADTS — с «-c copy» публикация просто не стартует
     // («AAC with no global headers»), aac_adtstoasc тут не помогает, потому что
     // заголовок SDP пишется до первого пакета.
-    const child = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-fflags', '+genpts+discardcorrupt',
+    const child = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', '-fflags', '+genpts+discardcorrupt',
       // Без nobuffer и с запасом на разбор: публикация стартует раньше, чем
       // relay выдаст первый кадр, и с урезанным probesize ffmpeg сдавался —
       // «dimensions not set», падение, перезапуск по кругу. Теперь он спокойно
@@ -2731,8 +2716,9 @@ function pipeToRelay(child) {
   // добавлялся на каждый новый ролик, и за длинный эфир их набирались десятки
   // на одном сокете — Node предупреждал об утечке.
   child.stdout.pipe(relayProcess.stdin, { end: false });
+  const readPts = createPtsReader();
   child.stdout.on('data', chunk => {
-    trackRelayClock(chunk);
+    trackRelayClock(readPts(chunk));
     for (const [id, pusher] of rtspPushProcesses) {
       const sink = pusher.stdin;
       if (!sink?.writable) continue;
@@ -2755,7 +2741,7 @@ function startRelay(profile) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts+discardcorrupt',
     '-probesize', '1000000', '-analyzeduration', '1000000', '-thread_queue_size', '1024', '-f', 'mpegts', '-i', 'pipe:0',
     '-map', '0:v:0', '-map', '0:a:0', ...relayOutputArgs(profile)];
-  relayProcess = spawn('ffmpeg', args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+  relayProcess = spawnFfmpeg(args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
   relayProcess.stdin.on('error', error => {
     if (!stopping) log(`Канал HLS: ${error.message}`);
   });
@@ -2805,7 +2791,7 @@ function preparePausedFrame(media, position, preferredBroadcastFrame = null, pre
     rmSync(frameFile, { force: true });
     const seekArgs = broadcastFrameSource ? [] : ['-ss', Math.max(0, Number(position) || 0).toFixed(3)];
     const frameFilter = `${broadcastFrameSource ? 'reverse,' : ''}scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
-    const extractor = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...seekArgs, '-i', source,
+    const extractor = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', ...seekArgs, '-i', source,
       '-frames:v', '1', '-vf', frameFilter,
       '-c:v', 'png', '-threads', '1', '-update', '1', '-y', frameFile],
     { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -2826,7 +2812,7 @@ function startPausedFrameProducer(frameFile) {
   const args = ['-hide_banner', '-loglevel', 'warning', '-re', '-loop', '1', '-framerate', String(profile.fps), '-i', frameFile,
     '-re', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-map', '0:v:0', '-map', '1:a:0',
     '-r', String(profile.fps), '-fps_mode', 'cfr', ...mpegTsOutputArgs(profile)];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   standbyProcess = child;
   pipeToRelay(child);
   attachProcessLogs(child, 'Paused frame');
@@ -2874,7 +2860,7 @@ function startStandby(profile = sessionProfile()) {
     '-re', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', '-map', '0:v:0', '-map', '1:a:0',
     '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
     '-r', String(profile.fps), '-fps_mode', 'cfr', ...mpegTsOutputArgs(profile)];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   standbyProcess = child;
   pipeToRelay(child);
   attachProcessLogs(child, 'Standby');
@@ -2897,6 +2883,10 @@ function ensureRelay(profile = streamProfile()) {
 function startQueue(initialIndex = 0) {
   if (!queue.length) throw new Error('Очередь пуста. Добавьте ссылку или файл.');
   const wasLive = Boolean(activeKind);
+  // Прогрев, начатый до эфира, качает на полной скорости. Стартовый трек и
+  // ближайшие к нему пусть докачиваются — их и ждём, остальные уступают канал
+  // эфиру и потом догрузятся бережно.
+  stopMediaCacheDownloads(nearbyIds(initialIndex));
   stopActive(false, true, true);
   stopping = false;
   activeKind = 'queue';
@@ -3157,9 +3147,12 @@ function startCacheDownload(item) {
     mediaCacheProcesses.set(child, item.id);
     let stderr = '';
     child.stderr.setEncoding('utf8'); child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16000); });
-    child.on('error', reject);
+    child.on('error', error => { mediaCacheProcesses.delete(child); reject(error); });
     child.on('close', code => {
       mediaCacheProcesses.delete(child);
+      // Загрузку остановили мы сами (переход, удаление, выход) — это не сбой
+      // источника, и штрафовать трек за неё нельзя.
+      if (cancelledCacheChildren.has(child)) return reject(Object.assign(new Error('Загрузка отменена'), { cancelled: true }));
       if (code !== 0) return reject(new Error((stderr || `yt-dlp завершился с кодом ${code}`).trim().split(/\r?\n/).pop()));
       const file = cachedMediaPath(item.id);
       if (!file) return reject(new Error('Загруженный файл не найден.'));
@@ -3176,7 +3169,7 @@ function startCacheDownload(item) {
 // стоял в ожидании, пока yt-dlp тянет файл целиком. Такие играем прямо из сети.
 const CACHE_MAX_SECONDS = 25 * 60;
 
-function stableQueueMedia(item) {
+function stableQueueMedia(item, { prefetch = false } = {}) {
   if (item.local) return resolveItem(item);
   // Живой поток скачать нельзя: он бесконечный. Играем напрямую.
   if (item.live) return resolveItem(item);
@@ -3188,6 +3181,15 @@ function stableQueueMedia(item) {
   if (!готовый && cacheDeclinedNow(item.id)) return resolveItem(item);
   if (!готовый && Number(item.duration) > CACHE_MAX_SECONDS) return resolveItem(item);
   return downloadRemoteMedia(item).then(media => { clearMediaFailure(item.id); return media; }).catch(error => {
+    // Отменённая загрузка ничего не говорит о треке: прогрев просто молча
+    // заканчивается, а воспроизведение идёт напрямую из сети. Раньше отмена
+    // (а она случалась на каждом «Начать эфир» и «Следующий») записывалась
+    // в неудачи, и трек на пять минут лишался кеша — первый же ролик после
+    // старта играл из сети вместо заранее скачанного файла.
+    if (error?.cancelled) {
+      if (prefetch) throw error;
+      return resolveItem(item);
+    }
     // Прямой поток YouTube живёт минуты и часто отдаёт 403 — на него
     // переключаемся молча, но причину пишем в файл для разбора.
     logDetail(`Буфер не собрался для «${item.title}»: ${error.message}`);
@@ -3197,12 +3199,24 @@ function stableQueueMedia(item) {
   });
 }
 
-function stopMediaCacheDownloads() {
-  for (const [child, itemId] of mediaCacheProcesses) {
+const cancelledCacheChildren = new WeakSet();
+
+// Останавливает фоновые загрузки, кроме тех, что нужны прямо сейчас (keep —
+// id треков). Трек, на который человек переходит, докачивается дальше:
+// раньше «Следующий» убивал загрузку именно того ролика, который надо играть.
+function stopMediaCacheDownloads(keep = []) {
+  const оставить = new Set(keep.filter(Boolean));
+  for (const [child, itemId] of [...mediaCacheProcesses]) {
+    if (оставить.has(itemId)) continue;
+    cancelledCacheChildren.add(child);
     mediaCacheJobs.delete(itemId);
+    mediaCacheProcesses.delete(child);
     try { child.kill('SIGTERM'); } catch {}
   }
-  mediaCacheProcesses.clear();
+}
+
+function cancelCacheDownload(itemId) {
+  stopMediaCacheDownloads([...mediaCacheProcesses.values()].filter(id => id !== itemId));
 }
 
 function unityVideoEncodeArgs(profile) {
@@ -3221,7 +3235,7 @@ function unityVideoEncodeArgs(profile) {
 
 function runUnityFfmpeg(args, label, generation = unityBuildGeneration) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
     unityBuildProcess = child;
     let stderr = '';
     child.stderr.setEncoding('utf8');
@@ -3326,7 +3340,7 @@ function startUnityCaptureRecording() {
   const args = ['-hide_banner', '-loglevel', 'warning', '-live_start_index', '-2', '-i', `http://127.0.0.1:${PORT}/stream/live.m3u8`,
     '-map', '0:v:0', '-map', '0:a:0', '-vf', 'setpts=PTS-STARTPTS', '-af', 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0',
     ...unityVideoEncodeArgs(profile), '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2', '-movflags', '+faststart', '-y', temporary];
-  const child = spawn('ffmpeg', args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+  const child = spawnFfmpeg(args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
   unityCaptureProcess = child; unityCaptureStartedAt = Date.now();
   unityCapture = { state: 'recording', message: 'Идёт запись захвата…', updatedAt: Date.now() };
   let stderr = '';
@@ -3372,6 +3386,13 @@ const ПАУЗА_ПЕРЕХОДА = 40;
 const ПАУЗА_ОЧЕРЕДИ = 25;
 const ПАУЗА_ПОВТОРА = 120;
 
+// Трек, на который переходим, и те, что прогрев всё равно возьмёт следом.
+function nearbyIds(index) {
+  const ids = [];
+  for (let шаг = 0; шаг <= PREFETCH_AHEAD && queue.length; шаг++) ids.push(queue[(Math.max(0, index) + шаг) % queue.length]?.id);
+  return ids;
+}
+
 let prefetching = false;
 async function prefetchQueue(fromIndex = queueIndex) {
   if (prefetching || !queue.length) return;
@@ -3384,8 +3405,9 @@ async function prefetchQueue(fromIndex = queueIndex) {
       if (!item || item.local || item.direct || item.live || item.id === currentId) continue;
       if (cachedMediaPath(item.id) || cacheDeclinedNow(item.id) || mediaFailure(item.id)) continue;
       if (!queue.some(entry => entry.id === item.id)) continue;
-      try { await stableQueueMedia(item); }
+      try { await stableQueueMedia(item, { prefetch: true }); }
       catch (error) {
+        if (error?.cancelled) continue;
         declineCache(item.id, error.message);
         log(`Прогрев «${item.title}»: ${error.message}`);
       }
@@ -3393,9 +3415,13 @@ async function prefetchQueue(fromIndex = queueIndex) {
   } finally { prefetching = false; }
 }
 
-// Декодирование отдаём видеокарте: при неудаче ffmpeg сам возвращается к
-// программному пути, поэтому флаг безопасен для любых источников.
-const HWACCEL = ['-hwaccel', 'auto'];
+// Декодирование отдаём видеокарте: обычно при неудаче ffmpeg сам
+// возвращается к программному пути. Но не всегда — со сломанным драйвером
+// (или без libva) ffmpeg падает аварийно на первом кадре, и трек тут же
+// «заканчивался». Тогда до конца сеанса декодируем процессором.
+let hwDecode = true;
+const HWDECODE_TROUBLE = /Device creation failed|hwaccel|hw_device|Assertion .* failed|Failed to (?:create|initialise) .*(?:device|decoder)/i;
+function hwaccelArgs() { return hwDecode ? ['-hwaccel', 'auto'] : []; }
 
 function queueProducerArgs(media, timestampOffset, seekPosition = 0) {
   const profile = sessionProfile('queue');
@@ -3414,7 +3440,7 @@ function queueProducerArgs(media, timestampOffset, seekPosition = 0) {
   }
   if (media.videoUrl && media.audioUrl && media.videoUrl !== media.audioUrl) {
     if (seekPosition > 0) args.push('-ss', seekPosition.toFixed(3));
-    args.push(...headerArgs, '-thread_queue_size', '1024', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', ...HWACCEL, '-re', '-i', media.videoUrl);
+    args.push(...headerArgs, '-thread_queue_size', '1024', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', ...hwaccelArgs(), '-re', '-i', media.videoUrl);
     videoIndex = inputIndex++;
     if (seekPosition > 0) args.push('-ss', seekPosition.toFixed(3));
     args.push(...headerArgs, '-thread_queue_size', '1024', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', '-re', '-i', media.audioUrl);
@@ -3429,7 +3455,7 @@ function queueProducerArgs(media, timestampOffset, seekPosition = 0) {
     // видео просто игнорируется) и всегда держим темп реального времени:
     // без него готовый плейлист проглатывается вдвое быстрее и эфир уезжает.
     if (media.live) args.push('-live_start_index', '-1');
-    args.push(...HWACCEL, '-re', '-i', source);
+    args.push(...hwaccelArgs(), '-re', '-i', source);
     if (media.hasVideo) videoIndex = inputIndex;
     if (media.hasAudio) audioIndex = inputIndex;
     inputIndex++;
@@ -3504,15 +3530,17 @@ async function startQueueItem(index, position = 0, generation = playGeneration, 
     if (manualTransition) return;
     currentDuration = media.duration || item.duration || null;
     stopStandby();
-    const child = spawn('ffmpeg', queueProducerArgs(media, markProducerTimestamp(nextProducerTimestamp()), sourcePosition), { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawnFfmpeg(queueProducerArgs(media, markProducerTimestamp(nextProducerTimestamp()), sourcePosition), { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     activeProcess = child;
     pipeToRelay(child);
     currentStartedAt = Date.now();
     playbackBusy = false;
     log(`Сейчас играет: ${item.title}`);
     attachProcessLogs(child, 'Track');
+    let hwTrouble = false;
+    child.stderr?.on('data', chunk => { if (hwDecode && HWDECODE_TROUBLE.test(String(chunk))) hwTrouble = true; });
     preloadNext(queueIndex);
-    child.on('close', code => {
+    child.on('close', (code, signal) => {
       // A rapid seek/jump may already have replaced this producer.  In that
       // case its late close event must not advance or stop the new track.
       if (activeProcess !== child) return;
@@ -3529,6 +3557,14 @@ async function startQueueItem(index, position = 0, generation = playGeneration, 
       // При переходе на другой трек заставку не поднимаем: следующий
       // производитель стартует через десятки миллисекунд, а лишний запуск
       // ffmpeg только добавлял задержку на каждое переключение.
+      // Аварийное падение на аппаратном декодере — не конец трека: повторяем
+      // с того же места, но уже процессором.
+      if (!transition && (code || signal) && hwTrouble && hwDecode && ranFor < 8) {
+        hwDecode = false;
+        playbackBusy = true;
+        log('Аппаратное декодирование не работает на этой машине — перехожу на процессор');
+        return setTimeout(() => startQueueItem(queueIndex, sourcePosition, generation, retry), ПАУЗА_ПОВТОРА);
+      }
       if (transition?.type !== 'seek' && transition?.type !== 'jump') startStandby(sessionProfile('queue'));
       if (transition?.type === 'seek') return setTimeout(() => startQueueItem(queueIndex, transition.position, generation), ПАУЗА_ПЕРЕХОДА);
       if (transition?.type === 'jump') return setTimeout(() => startQueueItem(transition.index, transition.position || 0, generation), ПАУЗА_ПЕРЕХОДА);
@@ -3571,7 +3607,9 @@ function consumeManualTransition(generation = playGeneration) {
 
 function stopActive(clearCurrent = true, keepTunnel = true, keepRelay = true) {
   stopping = true;
-  stopMediaCacheDownloads();
+  // Загрузки в кеш переживают остановку и смену источника: это прогрев на
+  // будущее, эфиру он не мешает. Гасим их только при полной остановке.
+  if (!keepRelay) stopMediaCacheDownloads();
   stopWindowWatch();
   playGeneration++;
   preparingNext = false;
@@ -3634,10 +3672,10 @@ function transitionQueue(type, value = null) {
     playbackBusy = true;
     manualTransition = { type: 'seek', position };
   } else if (type === 'next' || type === 'previous') {
-    stopMediaCacheDownloads();
     let target = queueIndex + (type === 'next' ? 1 : -1);
     if (target >= queue.length) target = config.loopMode === 'all' ? 0 : queue.length - 1;
     if (target < 0) target = config.loopMode === 'all' ? queue.length - 1 : 0;
+    stopMediaCacheDownloads(nearbyIds(target));
     queuePaused = false;
     sourcePosition = 0; pausedPosition = 0; currentStartedAt = null;
     playbackBusy = true; playbackRevision++;
@@ -3649,8 +3687,8 @@ function transitionQueue(type, value = null) {
 
 function transitionQueueTo(index, position = 0) {
   if (activeKind !== 'queue') throw new Error('Очередь сейчас не играет.');
-  stopMediaCacheDownloads();
   const target = Math.max(0, Math.min(queue.length - 1, Number(index) || 0));
+  stopMediaCacheDownloads(nearbyIds(target));
   queuePaused = false;
   sourcePosition = Math.max(0, Number(position) || 0); pausedPosition = sourcePosition; currentStartedAt = null;
   playbackBusy = true; playbackRevision++;
@@ -3697,23 +3735,6 @@ function playbackCommand(body) {
   return status();
 }
 
-// Имя файла в прямой ссылке часто ничего не значит: у кинохостингов это
-// «720.mp4» или «index.m3u8» — по такой подписи в списке не найдёшь ничего.
-// Берём название из самого файла, а если его нет — имя сайта и качество.
-const БЕЗЛИКИЕ_ИМЕНА = /^(\d{3,4}p?|video|movie|index|master|playlist|stream|out|file|media)$/i;
-
-function directTitle(rawUrl, сведения) {
-  const адрес = new URL(rawUrl);
-  const файл = decodeURIComponent(адрес.pathname.split('/').filter(Boolean).pop() || '');
-  const основа = файл.replace(/\.[a-z0-9]{2,5}$/i, '');
-  const изФайла = String(сведения?.title || '').trim();
-  if (изФайла && !БЕЗЛИКИЕ_ИМЕНА.test(изФайла)) return изФайла.slice(0, 200);
-  if (основа && !БЕЗЛИКИЕ_ИМЕНА.test(основа)) return файл.slice(0, 200);
-  const сайт = адрес.hostname.replace(/^www\./i, '').split('.').slice(0, -1).join('.') || адрес.hostname;
-  const качество = сведения?.height ? ` ${сведения.height}p` : (основа ? ` ${основа}` : '');
-  return `Видео с ${сайт}${качество}`.slice(0, 200);
-}
-
 // Разбор прямой ссылки: ffprobe идёт по сети и читает только заголовок файла,
 // поэтому двухчасовой фильм разбирается за те же секунды, что и клип.
 async function directMediaInfo(rawUrl) {
@@ -3742,8 +3763,9 @@ async function addUrl(rawUrl) {
   if (!validWebUrl(rawUrl)) throw new Error('Вставьте полную ссылку с http:// или https://');
   const host = new URL(rawUrl).hostname.toLowerCase();
   if (host === 'open.spotify.com') throw new Error('Spotify не отдаёт полный трек. Для Spotify используйте захват окна и звук компьютера.');
-  if (!tools.ytdlp) throw new Error('Компонент загрузки видео не найден.');
   const direct = DIRECT_LIVE.test(rawUrl) || DIRECT_FILE.test(rawUrl);
+  // Прямой ссылке на файл загрузчик не нужен — её открывает сам ffmpeg.
+  if (!direct && !tools.ytdlp) throw new Error('Компонент загрузки видео не найден.');
   if (direct) {
     const live = DIRECT_LIVE.test(rawUrl);
     // Прямую ссылку сразу открываем и смотрим, что там: длительность, есть ли
@@ -3806,40 +3828,11 @@ async function addUrl(rawUrl) {
 const FFPROBE_ARGS = ['-v', 'error', '-show_entries',
   'format=duration,format_name:stream=codec_type,codec_name:stream_disposition=attached_pic', '-of', 'json'];
 
-function mediaInfo(filePath) {
-  const result = spawnSync('ffprobe', [...FFPROBE_ARGS, filePath], {
-    windowsHide: true, encoding: 'utf8', timeout: 20000, maxBuffer: 2 * 1024 * 1024,
-  });
-  if (result.error || result.status !== 0) throw new Error('FFprobe не смог прочитать файл.');
-  return parseMediaInfo(result.stdout);
-}
 
 async function mediaInfoAsync(filePath) {
   const result = await spawnCollect('ffprobe', [...FFPROBE_ARGS, filePath], 20000);
   if (result.status !== 0) throw new Error('FFprobe не смог прочитать файл.');
   return parseMediaInfo(result.stdout);
-}
-
-// Обложка альбома лежит в файле как «видео» из одного кадра. Считать её видео
-// нельзя: у музыкального файла тогда выбиралась картинка вместо звуковой
-// дорожки, эфир получал один кадр и обрывался, а у фильма с постером первым
-// потоком в эфир уходил постер вместо самого фильма.
-function настоящееВидео(stream) {
-  return stream.codec_type === 'video' && !stream.disposition?.attached_pic;
-}
-
-function parseMediaInfo(stdout) {
-  const data = JSON.parse(stdout);
-  const videoCodec = data.streams?.find(настоящееВидео)?.codec_name || '';
-  const audioCodec = data.streams?.find(stream => stream.codec_type === 'audio')?.codec_name || '';
-  const mp4Container = String(data.format?.format_name || '').split(',').some(name => ['mov', 'mp4', 'm4a', '3gp', '3g2', 'mj2'].includes(name));
-  return {
-    duration: Number(data.format?.duration) || null,
-    hasVideo: data.streams?.some(настоящееВидео) || false,
-    hasAudio: data.streams?.some(stream => stream.codec_type === 'audio') || false,
-    videoCodec, audioCodec,
-    unityCompatible: mp4Container && videoCodec === 'h264' && (!audioCodec || audioCodec === 'aac'),
-  };
 }
 
 // Превью делаются по два за раз. Раньше на каждый добавленный файл сразу
@@ -3868,7 +3861,7 @@ function качатьПревью() {
          '-frames:v', '1', '-vf', 'scale=320:-2', '-q:v', '4', '-y', destination]
       : ['-hide_banner', '-loglevel', 'error', '-i', item.sourceUrl,
          '-an', '-map', 'disp:attached_pic', '-vf', 'scale=320:-2', '-q:v', '4', '-y', destination];
-    const child = spawn('ffmpeg', args, { windowsHide: true, stdio: 'ignore' });
+    const child = spawnFfmpeg(args, { windowsHide: true, stdio: 'ignore' });
     previewChildren.add(child);
     const дальше = () => { previewChildren.delete(child); занятоПревью--; качатьПревью(); };
     child.on('close', code => {
@@ -4085,7 +4078,7 @@ async function ensureLivePreview() {
     if (!existsSync(helper)) return false;
     const захват = spawn(helper, ['--hwnd', String(rect.handle), '--width', '960', '--height', '540', '--fps', кадры],
       { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
-    const перевод = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12',
+    const перевод = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12',
       '-video_size', '960x540', '-framerate', кадры, '-i', 'pipe:0',
       '-vf', `fps=${кадры}`, '-q:v', '5', '-update', '1', '-y', CAPTURE_PREVIEW],
       { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
@@ -4098,7 +4091,7 @@ async function ensureLivePreview() {
     if (rect) args.push('-offset_x', String(rect.x), '-offset_y', String(rect.y), '-video_size', `${rect.width}x${rect.height}`, '-i', 'desktop');
     else args.push('-i', 'desktop');
     args.push('-vf', 'scale=960:-2:flags=fast_bilinear', '-q:v', '5', '-update', '1', '-y', CAPTURE_PREVIEW);
-    previewProcess = spawn('ffmpeg', args, { windowsHide: true, stdio: 'ignore' });
+    previewProcess = spawnFfmpeg(args, { windowsHide: true, stdio: 'ignore' });
   }
   previewKind = вид;
   previewIdleTimer = setInterval(() => {
@@ -4129,7 +4122,7 @@ async function generateCapturePreview() {
     const helper = join(ROOT, 'tools', 'VRCast.WindowCapture.exe');
     if (!existsSync(helper)) throw new Error('Компонент изолированного захвата окна не найден.');
     const capture = spawn(helper, ['--hwnd', rect.handle, '--width', '960', '--height', '540', '--fps', '5'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    const converter = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12', '-video_size', '960x540', '-framerate', '5', '-i', 'pipe:0', '-frames:v', '1', '-q:v', '3', '-y', CAPTURE_PREVIEW], { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+    const converter = spawnFfmpeg(['-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pixel_format', 'nv12', '-video_size', '960x540', '-framerate', '5', '-i', 'pipe:0', '-frames:v', '1', '-q:v', '3', '-y', CAPTURE_PREVIEW], { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
     capture.stdout.on('error', () => {}); converter.stdin.on('error', () => {});
     capture.stdout.pipe(converter.stdin);
     let errorText = '';
@@ -4210,23 +4203,6 @@ function serveUnityMedia(req, res, id, public_ = false) {
   const item = queue.find(entry => entry.id === id);
   if (!item?.local || !item.unityCompatible || !existsSync(item.sourceUrl)) return false;
   return serveRangeMp4(req, res, item.sourceUrl, public_);
-}
-
-function prepareLivePlaylist(raw, segmentLimit, startOffset) {
-  const lines = raw.trimEnd().split(/\r?\n/);
-  const uriIndexes = lines.map((line, index) => line && !line.startsWith('#') ? index : -1).filter(index => index >= 0);
-  if (!uriIndexes.length) return raw;
-  const keepFrom = Math.max(0, uriIndexes.length - segmentLimit);
-  const firstSegmentTag = lines.findIndex(line => line.startsWith('#EXT-X-PROGRAM-DATE-TIME') || line.startsWith('#EXTINF'));
-  const bodyStart = keepFrom === 0 ? firstSegmentTag : uriIndexes[keepFrom - 1] + 1;
-  const header = lines.slice(0, Math.max(1, firstSegmentTag));
-  const sequenceIndex = header.findIndex(line => line.startsWith('#EXT-X-MEDIA-SEQUENCE:'));
-  if (sequenceIndex >= 0) {
-    const sequence = Number(header[sequenceIndex].split(':')[1]) || 0;
-    header[sequenceIndex] = `#EXT-X-MEDIA-SEQUENCE:${sequence + keepFrom}`;
-  }
-  header.splice(1, 0, `#EXT-X-START:TIME-OFFSET=-${startOffset},PRECISE=YES`);
-  return [...header, ...lines.slice(bodyStart), ''].join('\n');
 }
 
 // Свои адреса: только они имеют право на пульт управления.
@@ -4403,6 +4379,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/queue/')) {
       const id = decodeURIComponent(url.pathname.split('/').pop());
       const removedIndex = queue.findIndex(item => item.id === id);
+      cancelCacheDownload(id);
       queue = queue.filter(item => item.id !== id); forgetItemState(id); saveQueue();
       // Удаление играющего трека раньше оставляло висячий currentId и сбитый
       // queueIndex: UI показывал «эфир не запущен», а очередь после трека вставала.
@@ -4415,7 +4392,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, status());
     }
     if (req.method === 'DELETE' && url.pathname === '/api/queue') {
-      if (activeKind === 'queue') stopActive(); queue = []; resolvedMedia.clear(); mediaFailures.clear(); cacheDeclined.clear(); saveQueue(); return json(res, 200, status());
+      if (activeKind === 'queue') stopActive(); stopMediaCacheDownloads(); queue = []; resolvedMedia.clear(); mediaFailures.clear(); cacheDeclined.clear(); saveQueue(); return json(res, 200, status());
     }
     if (req.method === 'POST' && url.pathname === '/api/config') {
       const body = await readBody(req);
@@ -4644,7 +4621,7 @@ process.on('unhandledRejection', reason => {
 function killAllChildren() {
   const дети = [activeProcess, activeAuxProcess, activeWindowProcess, relayProcess, standbyProcess,
     pauseFrameProcess, mediaMtxProcess, tunnelProcess, unityBuildProcess, previewProcess, windowWatcher,
-    ...rtspPushProcesses.values(), ...mediaCacheProcesses.values(), ...tunnelCandidates, ...previewChildren];
+    ...rtspPushProcesses.values(), ...mediaCacheProcesses.keys(), ...tunnelCandidates, ...previewChildren];
   for (const child of дети) { try { child?.kill('SIGKILL'); } catch {} }
 }
 process.on('exit', killAllChildren);
