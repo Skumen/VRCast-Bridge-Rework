@@ -1274,7 +1274,9 @@ function unityCompatibility() {
 // Новая версия берётся из релизов на GitHub. Сам EXE заменить на ходу нельзя
 // (он занят), поэтому файл скачивается рядом, а подменяет его при выходе
 // маленький сценарий: дожидается закрытия программы, копирует и запускает.
-const UPDATE_REPO = 'Kevanko/VRCast-Bridge';
+// Форк обновляется из своих релизов. Сборки исходного репозитория подписаны
+// другим ключом и всё равно не прошли бы проверку подписи.
+const UPDATE_REPO = 'Skumen/VRCast-Bridge-Rework';
 const UPDATE_DIR = join(DATA_DIR, 'update');
 const UPDATE_FILE = join(UPDATE_DIR, 'VRCast Bridge.exe');
 

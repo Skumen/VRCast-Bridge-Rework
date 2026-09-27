@@ -6,7 +6,9 @@
 
 Экран, окно, видео или плейлист — одной ссылкой в видеоплеер VRChat.
 
-[![Скачать](https://img.shields.io/github/v/release/Kevanko/VRCast-Bridge?label=Скачать&style=flat-square&color=8b5cf6)](https://github.com/Kevanko/VRCast-Bridge/releases/latest)
+Форк [Kevanko/VRCast-Bridge](https://github.com/Kevanko/VRCast-Bridge).
+
+[![Скачать](https://img.shields.io/github/v/release/Skumen/VRCast-Bridge-Rework?label=Скачать&style=flat-square&color=8b5cf6)](https://github.com/Skumen/VRCast-Bridge-Rework/releases/latest)
 [![Лицензия MIT](https://img.shields.io/badge/лицензия-MIT-6366f1?style=flat-square)](LICENSE)
 ![Windows 10 и 11](https://img.shields.io/badge/Windows-10%20и%2011-0ea5e9?style=flat-square)
 
@@ -34,7 +36,7 @@
 
 ## Установка
 
-Скачайте [VRCast Bridge.exe](https://github.com/Kevanko/VRCast-Bridge/releases/latest) и запустите — это вся программа, установщик не нужен.
+Скачайте [VRCast Bridge.exe](https://github.com/Skumen/VRCast-Bridge-Rework/releases/latest) и запустите — это вся программа, установщик не нужен.
 
 Дополнительно нужны [Node.js 20+](https://nodejs.org), [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) в `PATH` и [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/). Загрузчик видео и медиасервер уже внутри файла.
 
@@ -79,8 +81,8 @@
 ## Сборка
 
 ```powershell
-git clone https://github.com/Kevanko/VRCast-Bridge.git
-cd VRCast-Bridge
+git clone https://github.com/Skumen/VRCast-Bridge-Rework.git
+cd VRCast-Bridge-Rework
 npm install
 powershell -ExecutionPolicy Bypass -File tools/fetch-tools.ps1
 
@@ -96,6 +98,16 @@ powershell -ExecutionPolicy Bypass -File tools/sign.ps1
 `npm test` — юнит-тесты чистой логики и интеграционные проверки, которые поднимают настоящий сервер и гоняют через него реальный поток (нужны `ffmpeg` и MediaMTX в `tools/`). `npm run test:unit` — только быстрые, без ffmpeg.
 
 GitHub Actions на каждом пуше гоняет тесты со стабильным и с master-ffmpeg и собирает неподписанный EXE (артефакт `VRCast-Bridge-unsigned`).
+
+## Выпуск версии
+
+Программа ищет обновления в [релизах этого репозитория](https://github.com/Skumen/VRCast-Bridge-Rework/releases). Чтобы обновление дошло до людей:
+
+1. Поднимите версию в `package.json`, `src/server.js` (`APP_VERSION`) и `launcher/VRCastBridge.Launcher.csproj`.
+2. Соберите и подпишите EXE (`tools/sign.ps1`).
+3. Создайте релиз с тегом `vX.Y.Z` и приложите `VRCast Bridge.exe`.
+
+Новая версия ставится, только если подписана **тем же сертификатом**, что и установленная. Сертификат создаётся один раз в хранилище Windows (`Cert:\CurrentUser\My`, «VRCast Bridge code signing») — экспортируйте его с закрытым ключом в .pfx и храните копию. Потеряете ключ — обновиться автоматически уже не выйдет, только скачать вручную.
 
 ## Лицензия
 
