@@ -7,9 +7,14 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { connect as netConnect } from 'node:net';
 import { statfs } from 'node:fs/promises';
+import { prepareLivePlaylist } from './lib/hls.js';
+import { directTitle, parseMediaInfo, настоящееВидео } from './lib/media.js';
+import { createPtsReader } from './lib/mpegts.js';
+import { isPrivateIp } from './lib/net.js';
+import { judgeUpdateSignature, parseSignatureLine, versionIsNewer } from './lib/update.js';
 import { INPUT_QUEUE_PROBE, READRATE_BURST_PROBE, adaptFfmpegArgs, pickFfmpegAsset } from './lib/ffmpeg-compat.js';
 
-const APP_VERSION = '0.54.10';
+const APP_VERSION = '0.55.0';
 const OFFLINE = process.env.VRCAST_OFFLINE === '1';
 
 // Свободное место проверяем редко и в фоне: на полном диске ffmpeg не может
@@ -1187,24 +1192,6 @@ function setServerLinkMode(id, { permanent, regenerate = false } = {}) {
   return next;
 }
 
-// «Белым» считаем только адрес, по которому машину реально видно из интернета.
-// Кроме RFC1918 отсекаем и то, что наружу не выходит: CGNAT провайдера,
-// тестовые диапазоны (в них часто сидят адаптеры VPN — тот же Koala Clash),
-// multicast и прочее зарезервированное. Иначе адрес VPN выдавался бы за белый.
-function isPrivateIp(ip) {
-  const p = ip.split('.').map(Number);
-  if (p.length !== 4 || p.some(n => Number.isNaN(n) || n < 0 || n > 255)) return true;
-  const [a, b] = p;
-  if (a === 10 || a === 127 || a === 0) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT провайдера
-  if (a === 198 && (b === 18 || b === 19)) return true; // тестовый диапазон / VPN
-  if (a >= 224) return true; // multicast и зарезервированное
-  return false;
-}
-
 // Прямые ссылки на локальный канал. Достаточно одной ссылки для своей сети —
 // берём домашний адрес (192.168/10), а не виртуальные адаптеры WSL/Hyper-V.
 // Белый IP (задан вручную или реальный публичный на карте) даёт ссылку через
@@ -1291,14 +1278,6 @@ const UPDATE_REPO = 'Kevanko/VRCast-Bridge';
 const UPDATE_DIR = join(DATA_DIR, 'update');
 const UPDATE_FILE = join(UPDATE_DIR, 'VRCast Bridge.exe');
 
-function versionIsNewer(candidate, current) {
-  const parse = value => String(value).replace(/^v/i, '').split('.').map(part => Number(part) || 0);
-  const [a, b] = [parse(candidate), parse(current)];
-  for (let index = 0; index < Math.max(a.length, b.length); index++) {
-    if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) > (b[index] || 0);
-  }
-  return false;
-}
 
 
 // Загрузка с докачкой. Оборванная связь на середине больше не означает
@@ -1329,7 +1308,14 @@ async function downloadWithResume(url, target, onProgress, попыток = 4) {
       for await (const кусок of ответ.body) {
         // Ждём и ошибку тоже: на переполненном диске drain не придёт никогда,
         // и загрузка висела бы вечно.
-        if (!файл.write(кусок)) await new Promise((ok, bad) => { файл.once('drain', ok); файл.once('error', bad); });
+        // Оба слушателя снимаются после срабатывания любого: иначе на каждый
+        // drain оставался висеть обработчик error, и за загрузку их копились
+        // сотни (MaxListenersExceededWarning).
+        if (!файл.write(кусок)) await new Promise((ok, bad) => {
+          const готово = () => { файл.off('error', сбой); ok(); };
+          const сбой = error => { файл.off('drain', готово); bad(error); };
+          файл.once('drain', готово); файл.once('error', сбой);
+        });
         принято += кусок.length;
         const процент = всего ? Math.round(принято / всего * 100) : 0;
         if (процент !== последнийПроцент) { последнийПроцент = процент; onProgress?.(принято, всего); }
@@ -1427,19 +1413,6 @@ async function refreshToolsAsync() {
   tools.plink = Boolean(PLINK());
 }
 
-function refreshTools() {
-  // ffmpeg зовут по имени из десятка мест — проще добавить свою папку в PATH,
-  // чем тащить путь через все вызовы.
-  if (existsSync(join(TOOL_DIR, 'ffmpeg.exe')) && !process.env.PATH.includes(TOOL_DIR)) {
-    process.env.PATH = `${TOOL_DIR};${process.env.PATH}`;
-  }
-  tools.ffmpeg = toolAvailable('ffmpeg', ['-version']);
-  tools.ytdlp = toolAvailable(ytdlpPath());
-  tools.cloudflared = Boolean(CLOUDFLARED()) && toolAvailable(CLOUDFLARED());
-  tools.pinggy = Boolean(PINGGY()) && toolAvailable(PINGGY());
-  tools.mediamtx = Boolean(MEDIAMTX());
-  tools.plink = Boolean(PLINK());
-}
 
 // Если утилита лежит рядом с программой (папка tools возле EXE) — берём её
 // оттуда и не качаем. Так же переезжает pinggy: публичной ссылки на него нет.
@@ -1547,15 +1520,15 @@ async function downloadUpdate(url, expectedSize) {
   }
 }
 
-// Совпадения размера мало: он ничего не говорит о том, чей это файл. Смотрим,
-// что скачанное подписано тем же издателем, что и сама программа. Полного
-// доверия к цепочке сертификатов здесь нет (сертификат свой), но подменить
-// файл на чужой или неподписанный уже не выйдет.
-const ИЗДАТЕЛЬ = 'CN=VRCast Bridge, O=VRCast Bridge';
-
+// Совпадения размера мало: он ничего не говорит о том, чей это файл. Новый
+// файл обязан быть подписан тем же ключом, что и запущенная программа (см.
+// judgeUpdateSignature) — тогда и чужой «VRCast Bridge», и сборка другого
+// форка, и испорченный после подписи файл отсеиваются.
 async function проверитьПодпись(файл) {
-  const скрипт = `(Get-AuthenticodeSignature -LiteralPath '${файл.replace(/'/g, "''")}') | `
-    + 'ForEach-Object { $_.Status.ToString() + [char]124 + $_.SignerCertificate.Subject }';
+  const путь = value => `'${String(value).replace(/'/g, "''")}'`;
+  const скрипт = `$n = Get-AuthenticodeSignature -LiteralPath ${путь(файл)}; `
+    + `$c = Get-AuthenticodeSignature -LiteralPath ${путь(process.env.VRCAST_EXE || '')}; `
+    + '$n.Status.ToString() + [char]124 + $n.SignerCertificate.Thumbprint + [char]124 + $c.SignerCertificate.Thumbprint';
   // Powershell запускаем с чистым PSModulePath: у собранной программы он в
   // унаследованном окружении бывал пустым/битым, и модуль Microsoft.PowerShell
   // .Security не подгружался — Get-AuthenticodeSignature падал «команда найдена
@@ -1565,23 +1538,21 @@ async function проверитьПодпись(файл) {
   const опции = { env: { ...process.env, PSModulePath: модули } };
   // Свежескачанный 50-МБ exe Windows Defender сразу берёт на проверку и держит
   // файл открытым — Get-AuthenticodeSignature в этот момент не может его
-  // прочитать и молча отдаёт пустоту («не удалось проверить»), из-за чего
-  // обновление срывалось. Поэтому повторяем несколько раз с паузой: как только
-  // антивирус отпускает файл, подпись читается.
-  let строка = '';
+  // прочитать и молча отдаёт пустоту, из-за чего обновление срывалось. Поэтому
+  // повторяем несколько раз с паузой: как только антивирус отпускает файл,
+  // подпись читается.
+  let сведения = parseSignatureLine('');
   for (let попытка = 0; попытка < 6; попытка++) {
     const результат = await spawnCollect('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', скрипт], 25000, опции).catch(() => null);
-    строка = String(результат?.stdout || '').trim();
-    if (строка) break;
+    сведения = parseSignatureLine(результат?.stdout);
+    if (сведения.status && (сведения.status !== 'UnknownError' || сведения.thumbprint)) break;
     logDetail(`Проверка подписи (попытка ${попытка + 1}): status=${результат?.status} stderr=${String(результат?.stderr || '').slice(0, 200)}`);
     await new Promise(resolve => setTimeout(resolve, 800));
   }
-  if (!строка) return { ok: false, причина: 'не удалось проверить (файл занят антивирусом)' };
-  const [состояние, издатель] = строка.split(String.fromCharCode(124));
-  if (состояние === 'NotSigned') return { ok: false, причина: 'файл не подписан' };
-  if (!String(издатель || '').includes('VRCast Bridge')) return { ok: false, причина: 'чужой издатель' };
-  return { ok: true, причина: состояние };
+  if (!сведения.status) return { ok: false, причина: 'не удалось проверить (файл занят антивирусом)' };
+  const вердикт = judgeUpdateSignature(сведения);
+  return { ok: вердикт.ok, причина: вердикт.reason };
 }
 
 // Сценарий подмены: ждёт закрытия программы, ставит новый файл и запускает его.
@@ -2043,19 +2014,6 @@ function bitrate(profile) {
   return `${bitrateKbps(profile)}k`;
 }
 
-function videoEncodeArgs(profile = streamProfile()) {
-  const rate = bitrate(profile);
-  const keyframes = Math.max(8, Math.round(profile.fps * 0.5));
-  const gop = ['-g', String(keyframes), '-keyint_min', String(keyframes)];
-  if (encoder.family === 'nvenc') return ['-c:v', 'h264_nvenc', '-preset', 'p2', '-tune', 'll', '-rc', 'cbr',
-    '-b:v', rate, '-maxrate', rate, '-bufsize', rate, ...gop, '-bf', '0', '-spatial-aq', '1', '-pix_fmt', 'yuv420p'];
-  if (encoder.family === 'amf') return ['-c:v', 'h264_amf', '-usage', 'lowlatency', '-rc', 'cbr',
-    '-b:v', rate, '-maxrate', rate, ...gop, '-bf', '0', '-pix_fmt', 'yuv420p'];
-  if (encoder.family === 'qsv') return ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-b:v', rate,
-    '-maxrate', rate, '-bufsize', rate, ...gop, '-bf', '0', '-async_depth', '1', '-pix_fmt', 'nv12'];
-  return ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p',
-    ...gop, '-sc_threshold', '0', '-b:v', rate, '-maxrate', rate, '-bufsize', rate];
-}
 
 // Раньше здесь стоял constqp: качество постоянное, а битрейт какой получится.
 // На игре это выстреливало до десятков мегабит, канал захлёбывался, и зритель
@@ -2093,12 +2051,6 @@ function producerEncodeArgs(profile = streamProfile()) {
     ...gop, '-sc_threshold', '0', '-bf', '0', '-pix_fmt', 'yuv420p'];
 }
 
-function encodedOutputArgs(profile = streamProfile()) {
-  const common = [...videoEncodeArgs(profile), '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-flush_packets', '1'];
-  return [...common, '-f', 'hls', '-hls_time', '1', '-hls_list_size', '40', '-hls_delete_threshold', '4',
-    '-hls_start_number_source', 'epoch_us', '-hls_flags', 'delete_segments+omit_endlist+program_date_time+independent_segments+temp_file',
-    '-hls_segment_filename', join(HLS_DIR, 'segment-%08d.ts'), join(HLS_DIR, 'live.m3u8')];
-}
 
 function relayOutputArgs(profile) {
   // Короткая история сегментов (~15с на диске): плеер, отставший сильнее,
@@ -2136,25 +2088,9 @@ function nextProducerTimestamp() {
 // возврат старых кадров. Теперь берём метку самого кадра (PTS) из заголовка PES.
 let lastRelayPts = 0;
 
-function trackRelayClock(chunk) {
-  for (let offset = 0; offset + 188 <= chunk.length; offset += 188) {
-    if (chunk[offset] !== 0x47) continue;                     // не начало пакета
-    if ((chunk[offset + 1] & 0x40) === 0) continue;           // не начало PES
-    const adaptation = (chunk[offset + 3] & 0x30) >> 4;
-    if (adaptation === 0 || adaptation === 2) continue;       // полезной нагрузки нет
-    let payload = offset + 4;
-    if (adaptation === 3) payload += 1 + chunk[offset + 4];   // пропускаем поле адаптации
-    if (payload + 14 > offset + 188) continue;
-    if (chunk[payload] !== 0 || chunk[payload + 1] !== 0 || chunk[payload + 2] !== 1) continue;
-    if ((chunk[payload + 7] & 0x80) === 0) continue;          // метки времени нет
-    const b = payload + 9;
-    const pts = (chunk[b] & 0x0e) * 536870912
-      + chunk[b + 1] * 4194304 + (chunk[b + 2] & 0xfe) * 16384
-      + chunk[b + 3] * 128 + ((chunk[b + 4] & 0xfe) >> 1);
-    const seconds = pts / 90000;
-    // Скачок больше часа — это чужая метка или переполнение, её не берём.
-    if (seconds > lastRelayPts && seconds - lastRelayPts < 3600) lastRelayPts = seconds;
-  }
+function trackRelayClock(seconds) {
+  // Скачок больше часа — это чужая метка или переполнение, её не берём.
+  if (seconds !== null && seconds > lastRelayPts && seconds - lastRelayPts < 3600) lastRelayPts = seconds;
 }
 
 function markProducerTimestamp(timestamp) {
@@ -2778,8 +2714,9 @@ function pipeToRelay(child) {
   // добавлялся на каждый новый ролик, и за длинный эфир их набирались десятки
   // на одном сокете — Node предупреждал об утечке.
   child.stdout.pipe(relayProcess.stdin, { end: false });
+  const readPts = createPtsReader();
   child.stdout.on('data', chunk => {
-    trackRelayClock(chunk);
+    trackRelayClock(readPts(chunk));
     for (const [id, pusher] of rtspPushProcesses) {
       const sink = pusher.stdin;
       if (!sink?.writable) continue;
@@ -3796,23 +3733,6 @@ function playbackCommand(body) {
   return status();
 }
 
-// Имя файла в прямой ссылке часто ничего не значит: у кинохостингов это
-// «720.mp4» или «index.m3u8» — по такой подписи в списке не найдёшь ничего.
-// Берём название из самого файла, а если его нет — имя сайта и качество.
-const БЕЗЛИКИЕ_ИМЕНА = /^(\d{3,4}p?|video|movie|index|master|playlist|stream|out|file|media)$/i;
-
-function directTitle(rawUrl, сведения) {
-  const адрес = new URL(rawUrl);
-  const файл = decodeURIComponent(адрес.pathname.split('/').filter(Boolean).pop() || '');
-  const основа = файл.replace(/\.[a-z0-9]{2,5}$/i, '');
-  const изФайла = String(сведения?.title || '').trim();
-  if (изФайла && !БЕЗЛИКИЕ_ИМЕНА.test(изФайла)) return изФайла.slice(0, 200);
-  if (основа && !БЕЗЛИКИЕ_ИМЕНА.test(основа)) return файл.slice(0, 200);
-  const сайт = адрес.hostname.replace(/^www\./i, '').split('.').slice(0, -1).join('.') || адрес.hostname;
-  const качество = сведения?.height ? ` ${сведения.height}p` : (основа ? ` ${основа}` : '');
-  return `Видео с ${сайт}${качество}`.slice(0, 200);
-}
-
 // Разбор прямой ссылки: ffprobe идёт по сети и читает только заголовок файла,
 // поэтому двухчасовой фильм разбирается за те же секунды, что и клип.
 async function directMediaInfo(rawUrl) {
@@ -3906,40 +3826,11 @@ async function addUrl(rawUrl) {
 const FFPROBE_ARGS = ['-v', 'error', '-show_entries',
   'format=duration,format_name:stream=codec_type,codec_name:stream_disposition=attached_pic', '-of', 'json'];
 
-function mediaInfo(filePath) {
-  const result = spawnSync('ffprobe', [...FFPROBE_ARGS, filePath], {
-    windowsHide: true, encoding: 'utf8', timeout: 20000, maxBuffer: 2 * 1024 * 1024,
-  });
-  if (result.error || result.status !== 0) throw new Error('FFprobe не смог прочитать файл.');
-  return parseMediaInfo(result.stdout);
-}
 
 async function mediaInfoAsync(filePath) {
   const result = await spawnCollect('ffprobe', [...FFPROBE_ARGS, filePath], 20000);
   if (result.status !== 0) throw new Error('FFprobe не смог прочитать файл.');
   return parseMediaInfo(result.stdout);
-}
-
-// Обложка альбома лежит в файле как «видео» из одного кадра. Считать её видео
-// нельзя: у музыкального файла тогда выбиралась картинка вместо звуковой
-// дорожки, эфир получал один кадр и обрывался, а у фильма с постером первым
-// потоком в эфир уходил постер вместо самого фильма.
-function настоящееВидео(stream) {
-  return stream.codec_type === 'video' && !stream.disposition?.attached_pic;
-}
-
-function parseMediaInfo(stdout) {
-  const data = JSON.parse(stdout);
-  const videoCodec = data.streams?.find(настоящееВидео)?.codec_name || '';
-  const audioCodec = data.streams?.find(stream => stream.codec_type === 'audio')?.codec_name || '';
-  const mp4Container = String(data.format?.format_name || '').split(',').some(name => ['mov', 'mp4', 'm4a', '3gp', '3g2', 'mj2'].includes(name));
-  return {
-    duration: Number(data.format?.duration) || null,
-    hasVideo: data.streams?.some(настоящееВидео) || false,
-    hasAudio: data.streams?.some(stream => stream.codec_type === 'audio') || false,
-    videoCodec, audioCodec,
-    unityCompatible: mp4Container && videoCodec === 'h264' && (!audioCodec || audioCodec === 'aac'),
-  };
 }
 
 // Превью делаются по два за раз. Раньше на каждый добавленный файл сразу
@@ -4310,23 +4201,6 @@ function serveUnityMedia(req, res, id, public_ = false) {
   const item = queue.find(entry => entry.id === id);
   if (!item?.local || !item.unityCompatible || !existsSync(item.sourceUrl)) return false;
   return serveRangeMp4(req, res, item.sourceUrl, public_);
-}
-
-function prepareLivePlaylist(raw, segmentLimit, startOffset) {
-  const lines = raw.trimEnd().split(/\r?\n/);
-  const uriIndexes = lines.map((line, index) => line && !line.startsWith('#') ? index : -1).filter(index => index >= 0);
-  if (!uriIndexes.length) return raw;
-  const keepFrom = Math.max(0, uriIndexes.length - segmentLimit);
-  const firstSegmentTag = lines.findIndex(line => line.startsWith('#EXT-X-PROGRAM-DATE-TIME') || line.startsWith('#EXTINF'));
-  const bodyStart = keepFrom === 0 ? firstSegmentTag : uriIndexes[keepFrom - 1] + 1;
-  const header = lines.slice(0, Math.max(1, firstSegmentTag));
-  const sequenceIndex = header.findIndex(line => line.startsWith('#EXT-X-MEDIA-SEQUENCE:'));
-  if (sequenceIndex >= 0) {
-    const sequence = Number(header[sequenceIndex].split(':')[1]) || 0;
-    header[sequenceIndex] = `#EXT-X-MEDIA-SEQUENCE:${sequence + keepFrom}`;
-  }
-  header.splice(1, 0, `#EXT-X-START:TIME-OFFSET=-${startOffset},PRECISE=YES`);
-  return [...header, ...lines.slice(bodyStart), ''].join('\n');
 }
 
 // Свои адреса: только они имеют право на пульт управления.
