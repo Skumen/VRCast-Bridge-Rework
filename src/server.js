@@ -10,6 +10,7 @@ import { statfs } from 'node:fs/promises';
 import { INPUT_QUEUE_PROBE, READRATE_BURST_PROBE, adaptFfmpegArgs, pickFfmpegAsset } from './lib/ffmpeg-compat.js';
 
 const APP_VERSION = '0.54.10';
+const OFFLINE = process.env.VRCAST_OFFLINE === '1';
 
 // Свободное место проверяем редко и в фоне: на полном диске ffmpeg не может
 // дописывать сегменты, эфир встаёт рывками, а причина ниоткуда не видна.
@@ -1465,6 +1466,8 @@ async function ensureTools() {
     process.env.PATH = `${TOOL_DIR};${process.env.PATH}`;
   }
   await refreshToolsAsync();
+  // Без сети (тесты, CI, офлайн-сборка) ничего не докачиваем.
+  if (OFFLINE) return;
   const нужно = [];
   if (!existsSync(join(TOOL_DIR, 'yt-dlp.exe')) && !existsSync(YTDLP_UPDATED)) нужно.push('yt-dlp.exe');
   if (!tools.mediamtx) нужно.push('mediamtx.exe');
@@ -1481,7 +1484,7 @@ async function ensureTools() {
 let updateRetryTimer = null;
 
 async function checkForUpdate() {
-  if (!process.env.VRCAST_EXE) return;
+  if (!process.env.VRCAST_EXE || OFFLINE) return;
   try {
     const response = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
       headers: { 'User-Agent': 'VRCast-Bridge', Accept: 'application/vnd.github+json' },
@@ -2418,6 +2421,8 @@ async function startScreenInner() {
   // требует нового захвата окна, но звук при этом трогать незачем.
   keepAudioHelper = тотЖеЗахват && Boolean(activeAuxProcess) && audioHelperSignature() === audioHelperKey;
   keepWindowHelper = тотЖеЗахват && Boolean(activeWindowProcess) && windowHelperSignature(текущийПрофиль) === windowHelperKey;
+  // Захвату экрана прогрев очереди не нужен, а канал нужен весь.
+  if (!тотЖеЗахват) stopMediaCacheDownloads();
   stopActive(false, true, true);
   currentId = null; currentStartedAt = null; currentDuration = null;
   const desired = streamProfile('screen');
@@ -2939,6 +2944,10 @@ function ensureRelay(profile = streamProfile()) {
 function startQueue(initialIndex = 0) {
   if (!queue.length) throw new Error('Очередь пуста. Добавьте ссылку или файл.');
   const wasLive = Boolean(activeKind);
+  // Прогрев, начатый до эфира, качает на полной скорости. Стартовый трек и
+  // ближайшие к нему пусть докачиваются — их и ждём, остальные уступают канал
+  // эфиру и потом догрузятся бережно.
+  stopMediaCacheDownloads(nearbyIds(initialIndex));
   stopActive(false, true, true);
   stopping = false;
   activeKind = 'queue';
@@ -3199,9 +3208,12 @@ function startCacheDownload(item) {
     mediaCacheProcesses.set(child, item.id);
     let stderr = '';
     child.stderr.setEncoding('utf8'); child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16000); });
-    child.on('error', reject);
+    child.on('error', error => { mediaCacheProcesses.delete(child); reject(error); });
     child.on('close', code => {
       mediaCacheProcesses.delete(child);
+      // Загрузку остановили мы сами (переход, удаление, выход) — это не сбой
+      // источника, и штрафовать трек за неё нельзя.
+      if (cancelledCacheChildren.has(child)) return reject(Object.assign(new Error('Загрузка отменена'), { cancelled: true }));
       if (code !== 0) return reject(new Error((stderr || `yt-dlp завершился с кодом ${code}`).trim().split(/\r?\n/).pop()));
       const file = cachedMediaPath(item.id);
       if (!file) return reject(new Error('Загруженный файл не найден.'));
@@ -3218,7 +3230,7 @@ function startCacheDownload(item) {
 // стоял в ожидании, пока yt-dlp тянет файл целиком. Такие играем прямо из сети.
 const CACHE_MAX_SECONDS = 25 * 60;
 
-function stableQueueMedia(item) {
+function stableQueueMedia(item, { prefetch = false } = {}) {
   if (item.local) return resolveItem(item);
   // Живой поток скачать нельзя: он бесконечный. Играем напрямую.
   if (item.live) return resolveItem(item);
@@ -3230,6 +3242,15 @@ function stableQueueMedia(item) {
   if (!готовый && cacheDeclinedNow(item.id)) return resolveItem(item);
   if (!готовый && Number(item.duration) > CACHE_MAX_SECONDS) return resolveItem(item);
   return downloadRemoteMedia(item).then(media => { clearMediaFailure(item.id); return media; }).catch(error => {
+    // Отменённая загрузка ничего не говорит о треке: прогрев просто молча
+    // заканчивается, а воспроизведение идёт напрямую из сети. Раньше отмена
+    // (а она случалась на каждом «Начать эфир» и «Следующий») записывалась
+    // в неудачи, и трек на пять минут лишался кеша — первый же ролик после
+    // старта играл из сети вместо заранее скачанного файла.
+    if (error?.cancelled) {
+      if (prefetch) throw error;
+      return resolveItem(item);
+    }
     // Прямой поток YouTube живёт минуты и часто отдаёт 403 — на него
     // переключаемся молча, но причину пишем в файл для разбора.
     logDetail(`Буфер не собрался для «${item.title}»: ${error.message}`);
@@ -3239,12 +3260,24 @@ function stableQueueMedia(item) {
   });
 }
 
-function stopMediaCacheDownloads() {
-  for (const [child, itemId] of mediaCacheProcesses) {
+const cancelledCacheChildren = new WeakSet();
+
+// Останавливает фоновые загрузки, кроме тех, что нужны прямо сейчас (keep —
+// id треков). Трек, на который человек переходит, докачивается дальше:
+// раньше «Следующий» убивал загрузку именно того ролика, который надо играть.
+function stopMediaCacheDownloads(keep = []) {
+  const оставить = new Set(keep.filter(Boolean));
+  for (const [child, itemId] of [...mediaCacheProcesses]) {
+    if (оставить.has(itemId)) continue;
+    cancelledCacheChildren.add(child);
     mediaCacheJobs.delete(itemId);
+    mediaCacheProcesses.delete(child);
     try { child.kill('SIGTERM'); } catch {}
   }
-  mediaCacheProcesses.clear();
+}
+
+function cancelCacheDownload(itemId) {
+  stopMediaCacheDownloads([...mediaCacheProcesses.values()].filter(id => id !== itemId));
 }
 
 function unityVideoEncodeArgs(profile) {
@@ -3414,6 +3447,13 @@ const ПАУЗА_ПЕРЕХОДА = 40;
 const ПАУЗА_ОЧЕРЕДИ = 25;
 const ПАУЗА_ПОВТОРА = 120;
 
+// Трек, на который переходим, и те, что прогрев всё равно возьмёт следом.
+function nearbyIds(index) {
+  const ids = [];
+  for (let шаг = 0; шаг <= PREFETCH_AHEAD && queue.length; шаг++) ids.push(queue[(Math.max(0, index) + шаг) % queue.length]?.id);
+  return ids;
+}
+
 let prefetching = false;
 async function prefetchQueue(fromIndex = queueIndex) {
   if (prefetching || !queue.length) return;
@@ -3426,8 +3466,9 @@ async function prefetchQueue(fromIndex = queueIndex) {
       if (!item || item.local || item.direct || item.live || item.id === currentId) continue;
       if (cachedMediaPath(item.id) || cacheDeclinedNow(item.id) || mediaFailure(item.id)) continue;
       if (!queue.some(entry => entry.id === item.id)) continue;
-      try { await stableQueueMedia(item); }
+      try { await stableQueueMedia(item, { prefetch: true }); }
       catch (error) {
+        if (error?.cancelled) continue;
         declineCache(item.id, error.message);
         log(`Прогрев «${item.title}»: ${error.message}`);
       }
@@ -3627,7 +3668,9 @@ function consumeManualTransition(generation = playGeneration) {
 
 function stopActive(clearCurrent = true, keepTunnel = true, keepRelay = true) {
   stopping = true;
-  stopMediaCacheDownloads();
+  // Загрузки в кеш переживают остановку и смену источника: это прогрев на
+  // будущее, эфиру он не мешает. Гасим их только при полной остановке.
+  if (!keepRelay) stopMediaCacheDownloads();
   stopWindowWatch();
   playGeneration++;
   preparingNext = false;
@@ -3690,10 +3733,10 @@ function transitionQueue(type, value = null) {
     playbackBusy = true;
     manualTransition = { type: 'seek', position };
   } else if (type === 'next' || type === 'previous') {
-    stopMediaCacheDownloads();
     let target = queueIndex + (type === 'next' ? 1 : -1);
     if (target >= queue.length) target = config.loopMode === 'all' ? 0 : queue.length - 1;
     if (target < 0) target = config.loopMode === 'all' ? queue.length - 1 : 0;
+    stopMediaCacheDownloads(nearbyIds(target));
     queuePaused = false;
     sourcePosition = 0; pausedPosition = 0; currentStartedAt = null;
     playbackBusy = true; playbackRevision++;
@@ -3705,8 +3748,8 @@ function transitionQueue(type, value = null) {
 
 function transitionQueueTo(index, position = 0) {
   if (activeKind !== 'queue') throw new Error('Очередь сейчас не играет.');
-  stopMediaCacheDownloads();
   const target = Math.max(0, Math.min(queue.length - 1, Number(index) || 0));
+  stopMediaCacheDownloads(nearbyIds(target));
   queuePaused = false;
   sourcePosition = Math.max(0, Number(position) || 0); pausedPosition = sourcePosition; currentStartedAt = null;
   playbackBusy = true; playbackRevision++;
@@ -3798,8 +3841,9 @@ async function addUrl(rawUrl) {
   if (!validWebUrl(rawUrl)) throw new Error('Вставьте полную ссылку с http:// или https://');
   const host = new URL(rawUrl).hostname.toLowerCase();
   if (host === 'open.spotify.com') throw new Error('Spotify не отдаёт полный трек. Для Spotify используйте захват окна и звук компьютера.');
-  if (!tools.ytdlp) throw new Error('Компонент загрузки видео не найден.');
   const direct = DIRECT_LIVE.test(rawUrl) || DIRECT_FILE.test(rawUrl);
+  // Прямой ссылке на файл загрузчик не нужен — её открывает сам ffmpeg.
+  if (!direct && !tools.ytdlp) throw new Error('Компонент загрузки видео не найден.');
   if (direct) {
     const live = DIRECT_LIVE.test(rawUrl);
     // Прямую ссылку сразу открываем и смотрим, что там: длительность, есть ли
@@ -4459,6 +4503,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/queue/')) {
       const id = decodeURIComponent(url.pathname.split('/').pop());
       const removedIndex = queue.findIndex(item => item.id === id);
+      cancelCacheDownload(id);
       queue = queue.filter(item => item.id !== id); forgetItemState(id); saveQueue();
       // Удаление играющего трека раньше оставляло висячий currentId и сбитый
       // queueIndex: UI показывал «эфир не запущен», а очередь после трека вставала.
@@ -4471,7 +4516,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, status());
     }
     if (req.method === 'DELETE' && url.pathname === '/api/queue') {
-      if (activeKind === 'queue') stopActive(); queue = []; resolvedMedia.clear(); mediaFailures.clear(); cacheDeclined.clear(); saveQueue(); return json(res, 200, status());
+      if (activeKind === 'queue') stopActive(); stopMediaCacheDownloads(); queue = []; resolvedMedia.clear(); mediaFailures.clear(); cacheDeclined.clear(); saveQueue(); return json(res, 200, status());
     }
     if (req.method === 'POST' && url.pathname === '/api/config') {
       const body = await readBody(req);
@@ -4700,7 +4745,7 @@ process.on('unhandledRejection', reason => {
 function killAllChildren() {
   const дети = [activeProcess, activeAuxProcess, activeWindowProcess, relayProcess, standbyProcess,
     pauseFrameProcess, mediaMtxProcess, tunnelProcess, unityBuildProcess, previewProcess, windowWatcher,
-    ...rtspPushProcesses.values(), ...mediaCacheProcesses.values(), ...tunnelCandidates, ...previewChildren];
+    ...rtspPushProcesses.values(), ...mediaCacheProcesses.keys(), ...tunnelCandidates, ...previewChildren];
   for (const child of дети) { try { child?.kill('SIGKILL'); } catch {} }
 }
 process.on('exit', killAllChildren);
